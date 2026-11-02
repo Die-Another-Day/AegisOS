@@ -117,6 +117,20 @@ sudo secureos-lab --reset   # next class
 sudo secureos-lab --stop    # end of class, lab off
 ```
 
+
+## Saral, installed by default
+
+Saral v0.3.0 — the simplest automation language (`.srl` files,
+`saral` command, Python 3 stdlib only) — is installed by default in
+SecureOS: `build-image.sh` copies the repo-root `saral/` folder into
+the image at `/usr/local/bin/saral` +
+`/usr/local/lib/saral/libs/`, and `setup-v4.sh` re-copies it at
+guest-setup time and verifies with `saral version`. See
+`saral/SARAL-README.md` for what is copied and what is left out.
+Note: Saral is in the build from this head, but it is not yet proven
+inside a booted image until a new image is built from this head and
+`saral version` is verified inside a booted guest.
+
 ## Build it yourself
 
 `./build-image.sh` is the reproducible builder (adapted from v3:

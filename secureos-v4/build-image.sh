@@ -335,6 +335,28 @@ open(p, "w").write(s)
 PYEOF
 fi
 
+
+# --- 3b. Saral, installed by default (v0.3.0) ---------------------------
+# Copy the repo-root saral/ folder into the image at the same paths
+# setup-v4.sh uses, in the same style as the frontend copy above:
+# interpreter -> /usr/local/bin/saral, libraries ->
+# /usr/local/lib/saral/libs/, readme -> /usr/local/lib/saral/.
+# Skipped silently if saral/ is absent, so older checkouts still build.
+# This changes no lab, IR, or network logic. setup-v4.sh re-copies the
+# same files at guest-setup time if a saral/ payload is present, so
+# the two paths agree; verification (`saral version`) happens in
+# setup-v4.sh and must be checked in a booted guest (not proven here).
+if [ -f "$REPO_ROOT/saral/saral.py" ] && [ -d "$REPO_ROOT/saral/libs" ]; then
+  mkdir -p "$ROOTFS/usr/local/bin" "$ROOTFS/usr/local/lib/saral/libs"
+  cp "$REPO_ROOT/saral/saral.py" "$ROOTFS/usr/local/bin/saral"
+  chmod 755 "$ROOTFS/usr/local/bin/saral"
+  cp -r "$REPO_ROOT/saral/libs/." "$ROOTFS/usr/local/lib/saral/libs/"
+  [ -f "$REPO_ROOT/saral/SARAL-README.md" ] && cp "$REPO_ROOT/saral/SARAL-README.md" "$ROOTFS/usr/local/lib/saral/" || true
+  log "Saral installed by default: /usr/local/bin/saral + /usr/local/lib/saral/libs/"
+else
+  log "Saral not installed by build-image.sh: repo-root saral/ folder not found"
+fi
+
 # --- 4. grub.cfg inside the rootfs -----------------------------------------
 # fakechroot leaves /dev and /proc as symlinks to the HOST's /dev and /proc.
 # On a booted system those are self-referential loops and break switch_root

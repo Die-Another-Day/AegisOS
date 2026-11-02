@@ -24,6 +24,30 @@ for h in secureos-lab secureos-ir secureos-fim secureos-lab-reset-flags; do
   cp "$P/bin/$h" "/usr/local/bin/$h"; chmod 755 "/usr/local/bin/$h"
 done
 # Also keep v3 helpers (already in /usr/local/bin from v3 image)
+# --- Saral, installed by default (v0.3.0, prepared 2026-11-02) --------
+# Source: the repo-root saral/ folder, copied into the image by
+# build-image.sh (at /usr/local/bin/saral + /usr/local/lib/saral/),
+# or a saral/ folder next to this script / next to its parent dir
+# (manual payload). This block is idempotent: re-running it just
+# re-copies the same interpreter and libraries, then verifies.
+# It changes no lab, IR, or network logic.
+SARAL_SRC=""
+if [ -d "$P/saral" ]; then SARAL_SRC="$P/saral";
+elif [ -d "$P/../saral" ]; then SARAL_SRC="$P/../saral"; fi
+if [ -n "$SARAL_SRC" ] && [ -f "$SARAL_SRC/saral.py" ] && [ -d "$SARAL_SRC/libs" ]; then
+  mkdir -p /usr/local/lib/saral/libs
+  cp "$SARAL_SRC/saral.py" /usr/local/bin/saral; chmod 755 /usr/local/bin/saral
+  cp -r "$SARAL_SRC/libs/." /usr/local/lib/saral/libs/
+  rm -rf /usr/local/lib/saral/libs/__pycache__ 2>/dev/null || true
+  echo "Saral installed from $SARAL_SRC"
+elif [ -x /usr/local/bin/saral ]; then
+  echo "Saral already installed by build-image.sh, keeping it"
+else
+  echo "SARAL_NOT_INSTALLED (no saral/ payload and no /usr/local/bin/saral)"
+fi
+if command -v python3 >/dev/null 2>&1 && [ -x /usr/local/bin/saral ]; then
+  /usr/local/bin/saral version || echo "SARAL_VERIFY_FAILED"
+fi
 # Console wiring: add v4-console.js after v3-console.js if not present
 python3 - <<'PY'
 p="/opt/secureos/index.html"
