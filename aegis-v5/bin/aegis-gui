@@ -86,6 +86,16 @@ case "$MODE" in
     # The lock runs as a layer-shell overlay on top of sway; unlocking
     # returns here and the desktop shell starts.
     if [ -n "${SWAYSOCK:-}" ] || pgrep -u "$USER" sway >/dev/null 2>&1; then
+      # v5.0.1: wait briefly for sway to report a live output before
+      # starting the shell — on slow graphics (VirtualBox VMSVGA) the
+      # shell used to start while sway was still allocating buffers,
+      # and GTK found no screen yet. Bounded (15 s max); if no output
+      # ever appears, proceed anyway and let the shell's own display
+      # wait decide, with its clear no-display message.
+      for _ in $(seq 1 30); do
+        swaymsg -t get_outputs 2>/dev/null | grep -q '"active": true' && break
+        sleep 0.5
+      done
       AEGIS_TEST_UNLOCK="${AEGIS_TEST_UNLOCK:-0}" aegis-shell --lock
       exec aegis-shell --desktop
     else

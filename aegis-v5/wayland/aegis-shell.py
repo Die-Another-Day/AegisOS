@@ -160,6 +160,53 @@ window {{ background-color: transparent; }}
 .aegis-muted {{ color: #9aa3d0; }}
 """
 
+# v5.0.1: the shell must never die on a missing display.
+# Gdk.Screen.get_default() is None until GTK has opened a display, and
+# apply_css() used to be the first GTK call in every mode — before any
+# window existed — so on a serial console (no WAYLAND_DISPLAY at all)
+# and on slow graphics where sway had not finished bringing up an
+# output yet, the shell died with a bare TypeError ("Argument 0 does
+# not allow None as a value"). The modes below now go through
+# ensure_screen(), which initialises GTK explicitly, waits briefly
+# while a display may still be appearing, and otherwise exits with a
+# clear one-line message instead of a traceback.
+NO_DISPLAY_MSG = (
+    "aegis-shell: no graphical display found — run it inside a sway session "
+    "from the VM's own display (tty1) with `aegis-gui`, not from a serial console."
+)
+DISPLAY_WAIT_SECONDS = 10.0
+
+def ensure_screen():
+    """Return a usable Gdk.Screen, or None if no display appears."""
+    deadline = time.time() + DISPLAY_WAIT_SECONDS
+    while True:
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            return screen
+        # The environment names no display at all (serial console:
+        # WAYLAND_DISPLAY and DISPLAY both unset) — no retry can help.
+        if not os.environ.get("WAYLAND_DISPLAY") and not os.environ.get("DISPLAY"):
+            return None
+        try:
+            Gtk.init_check()
+        except Exception:
+            pass
+        screen = Gdk.Screen.get_default()
+        if screen is not None:
+            return screen
+        if time.time() >= deadline:
+            return None
+        time.sleep(0.5)
+
+def add_provider(prov):
+    """Attach a CSS provider to the default screen (or exit cleanly)."""
+    screen = Gdk.Screen.get_default() or ensure_screen()
+    if screen is None:
+        print(NO_DISPLAY_MSG, file=sys.stderr)
+        sys.exit(4)
+    Gtk.StyleContext.add_provider_for_screen(screen, prov,
+                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+
 def apply_css():
     css = BASE_CSS
     try:
@@ -167,8 +214,7 @@ def apply_css():
     except Exception:
         pass
     prov = Gtk.CssProvider(); prov.load_from_data(css.encode())
-    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
-                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    add_provider(prov)
 
 def layer_win(anchor_top=False, anchor_bottom=False, anchor_left=False, anchor_right=False,
               exclusive=0, layer=Layer.Layer.TOP if HAS_LAYER else None):
@@ -517,8 +563,7 @@ window { background-color: rgba(10, 14, 36, 0.96); }
   padding: 10px 14px; border: 1px solid #7a8cff; border-radius: 12px; font-weight: bold; }
 .aegis-launcher-btn:hover { background-image: none; background-color: #3d4fa8; }
 """)
-    Gtk.StyleContext.add_provider_for_screen(Gdk.Screen.get_default(), prov,
-                                             Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION)
+    add_provider(prov)
     win = Gtk.Window(); win.set_title("AegisOS launcher")
     win.set_default_size(640, 520); win.set_position(Gtk.WindowPosition.CENTER)
     win.set_decorated(False)
