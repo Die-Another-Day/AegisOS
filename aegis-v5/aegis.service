@@ -1,0 +1,14 @@
+[Unit]
+Description=AegisOS v5 console (localhost by default, LAN only in lab mode)
+After=network.target
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/aegis/server.py
+Restart=on-failure
+User=root
+Environment=SECUREOS_ALLOW_PUBLIC=0
+EnvironmentFile=-/etc/aegis-lab/env
+StandardOutput=journal
+StandardError=journal
+[Install]
+WantedBy=multi-user.target

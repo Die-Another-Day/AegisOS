@@ -1,0 +1,31 @@
+#!/bin/bash
+# aegis-wallpaper — switch wallpaper and re-derive the whole theme.
+# Usage: aegis-wallpaper <wallpaper.png | starfield | sunset>
+# Re-runs aegis-colours.py (dominant/accent -> theme.json/theme.css +
+# pre-blurred panel backgrounds), re-points swaybg, and re-renders the
+# swaylock background. The shell picks up the new theme on next start;
+# running shell instances re-read theme.css on their next refresh tick
+# for colours that are re-applied (bar labels); a full recolour needs a
+# shell restart (`aegis-gui --restart-shell`).
+set -euo pipefail
+CFG="$HOME/.config/aegis"
+mkdir -p "$CFG"
+case "${1:-}" in
+  starfield) SRC="/usr/share/aegis/wallpapers/aegis-starfield.png" ;;
+  sunset)    SRC="/usr/share/aegis/wallpapers/aegis-sunset.png" ;;
+  ""|--help|-h)
+    echo "Usage: aegis-wallpaper <wallpaper.png | starfield | sunset>"
+    echo "Wallpapers shipped: starfield, sunset (in /usr/share/aegis/wallpapers/)"
+    exit 0 ;;
+  *) SRC="$1" ;;
+esac
+[ -f "$SRC" ] || { echo "wallpaper not found: $SRC" >&2; exit 1; }
+cp "$SRC" "$CFG/wallpaper.png"
+python3 /usr/local/lib/aegis-shell/aegis-colours.py "$CFG/wallpaper.png" --out "$CFG"
+python3 /usr/local/lib/aegis-shell/aegis-shell.py --lock-bg "$CFG/lock-bg.png" 2>/dev/null || \
+  echo "note: lock-bg render needs GTK; it will be rendered on next GUI start"
+if command -v swaymsg >/dev/null 2>&1 && swaymsg -t get_version >/dev/null 2>&1; then
+  swaymsg output "*" bg "$CFG/wallpaper.png" fill
+  echo "swaybg reloaded"
+fi
+echo "Wallpaper switched to $SRC — widgets recoloured from the new palette."

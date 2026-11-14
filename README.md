@@ -1,3 +1,32 @@
+# AegisOS v5 — Nebula-style desktop (Sway, not Hyprland) + Red vs Blue lab
+
+> **v5 (new, 2026-11-14): AegisOS is the renamed SecureOS** (repo renamed
+> SecureOS → AegisOS; old URL redirects), with a new desktop in the style
+> of the Nebula reel: starfield lock screen with a big clock in a scalloped
+> disc and orbiting widgets, a floating-island top bar, scattered scalloped
+> widgets, and colours derived from the wallpaper. It is **sway 1.7 + an
+> original GTK3/Python shell — NOT real Hyprland/Quickshell**: current
+> Hyprland needs C++26 (gcc ≥ 16) and Quickshell needs Qt ≥ 6.6, and
+> Debian 12 bookworm ships gcc 12.2 / Qt 6.4.2, so neither can run here.
+> There is no live blur (panels use pre-blurred wallpaper slices) and no
+> live-animated lock screen in the swaylock path. Real Hyprland +
+> Quickshell would need a Debian 13 rebase — a v6 decision, not v5.
+> The v4 Red vs Blue lab is carried over, renamed (`aegis-lab`,
+> `aegis-ir`, `aegis-fim`); lab mode is OFF by default and the lab units
+> cannot start at boot (they have no `[Install]` section — see
+> `aegis-v5/README-v5.md`). Saral 0.3.0 is installed in the image
+> for the first time.
+> Full details: [`aegis-v5/README-v5.md`](aegis-v5/README-v5.md).
+> Try it: `./aegis-v5/run-qemu.sh`, then `aegis-gui` inside for the
+> desktop, or `aegis-lab --enable` inside for the lab. The multi-GB image
+> itself is NOT in this repo.
+> LAB ONLY, private LAN only, with consent of everyone on that LAN —
+> never the public internet.
+
+---
+
+*(The v4 banner below is kept for history; v4 is superseded by v5.)*
+
 # SecureOS — v4 is a real Red vs Blue lab, v3 added GUI on demand
 
 > **v4 (new, 2026-10-30): SecureOS is now a real, networked Red vs Blue classroom lab — NOT a simulation.** Install it on one device, and students on the same private LAN attack it and defend it for real: real SQL injection, real SSH and plugin-upload flags, real journal/log/FIM alerts, and real IR — contain, eradicate, recover, reset. Lab mode is OFF by default; `secureos-lab --enable` opens it to a private LAN address only, and `secureos-lab --stop` kills it all.

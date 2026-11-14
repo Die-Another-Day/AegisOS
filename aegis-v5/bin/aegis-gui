@@ -1,0 +1,120 @@
+#!/bin/bash
+# aegis-gui — start the AegisOS v5 graphical desktop ON DEMAND (Wayland).
+# Default boot is CLI + web console on http://127.0.0.1:8000 (unchanged).
+# This command does NOT change the default boot target.
+# v5 replaces the v4 XFCE session with sway 1.7 + the original GTK3/Python
+# layer-shell shell (aegis-shell.py). Real Hyprland/Quickshell are NOT in
+# this image: bookworm cannot build/run them (see README-v5.md).
+# Usage: aegis-gui [--window|--fullscreen|--lock|--secure-lock|--lock-and-desktop|--restart-shell|--stop|--help]
+#  --window           start sway + shell (default; sway fills the QEMU window)
+#  --fullscreen       start sway and request the largest output mode
+#  --lock             show the shell lock screen only (exits on unlock)
+#  --secure-lock      swaylock with the rendered lock frame (password = analyst login)
+#  --lock-and-desktop lock screen first, then the desktop shell (sway autostart)
+#  --restart-shell    restart the desktop shell inside a running sway session
+#  --stop             stop sway + shell and return to the CLI
+#  --help             show this help
+set -u
+MODE="window"
+for a in "$@"; do
+  case "$a" in
+    --help|-h)
+      echo "aegis-gui — start the AegisOS v5 GUI on demand (sway + aegis-shell)"
+      echo "  aegis-gui                  start sway + shell (default)"
+      echo "  aegis-gui --window         start sway + shell"
+      echo "  aegis-gui --fullscreen     start sway, largest output mode"
+      echo "  aegis-gui --lock           shell lock screen only"
+      echo "  aegis-gui --secure-lock    swaylock (analyst password) with rendered lock frame"
+      echo "  aegis-gui --lock-and-desktop  lock screen, then desktop (sway autostart)"
+      echo "  aegis-gui --restart-shell  restart the desktop shell in a running sway session"
+      echo "  aegis-gui --stop           stop sway + shell, back to CLI"
+      echo "Default boot stays CLI + web console at http://127.0.0.1:8000."
+      echo "GUI stack: sway 1.7, swaybg, swaylock, mako, foot, firefox-esr, aegis-shell (GTK3 layer-shell)."
+      echo "In the GUI, the Console launcher opens http://127.0.0.1:8000 in a browser."
+      exit 0 ;;
+    --window) MODE="window" ;;
+    --fullscreen) MODE="fullscreen" ;;
+    --lock) MODE="lock" ;;
+    --secure-lock) MODE="secure-lock" ;;
+    --lock-and-desktop) MODE="lock-and-desktop" ;;
+    --restart-shell) MODE="restart-shell" ;;
+    --stop)
+      echo "Stopping AegisOS GUI..."
+      pkill -u "$USER" sway 2>/dev/null || true
+      pkill -u "$USER" -f aegis-shell 2>/dev/null || true
+      pkill -u "$USER" swaybg 2>/dev/null || true
+      echo "GUI stopped. You are back on the CLI. Web console still runs on http://127.0.0.1:8000."
+      exit 0 ;;
+    *) echo "Unknown option: $a (try aegis-gui --help)" >&2; exit 1 ;;
+  esac
+done
+
+# Theme: the clean build's chroot colours step can fail under fakechroot
+# (libjpeg loader cache), even though Pillow + libjpeg are in the image.
+# Regenerate the theme on first GUI start if it is missing.
+mkdir -p "$HOME/.config/aegis"
+if [ ! -f "$HOME/.config/aegis/theme.json" ] && [ -f "$HOME/.config/aegis/wallpaper.png" ]; then
+  aegis-colours "$HOME/.config/aegis/wallpaper.png" --out "$HOME/.config/aegis" 2>/dev/null ||     echo "aegis-gui: theme regeneration failed (shell will use built-in defaults)" >&2
+fi
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+
+# Renderer: default to pixman (software). The GLES2 default segfaults in
+# Mesa kms_swrast on virtio-vga / no-GPU guests (sway dies in
+# kms_swrast_dri.so; shell reports "wl_display_roundtrip failed"). Pixman
+# was proven working in QEMU on 2026-11-12 (lock screen, desktop, widgets,
+# launcher all rendered). On a real GPU, set WLR_RENDERER=gles2 to opt in.
+export WLR_RENDERER="${WLR_RENDERER:-pixman}"
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+export WLR_RENDERER_ALLOW_SOFTWARE=1
+export MOZ_ENABLE_WAYLAND=1
+
+case "$MODE" in
+  lock)
+    command -v aegis-shell >/dev/null 2>&1 || { echo "ERROR: aegis-shell is not installed in this image." >&2; exit 1; }
+    exec aegis-shell --lock
+    ;;
+  secure-lock)
+    [ -f "$HOME/.config/aegis/lock-bg.png" ] || aegis-shell --lock-bg "$HOME/.config/aegis/lock-bg.png" 2>/dev/null || true
+    if [ -f "$HOME/.config/aegis/lock-bg.png" ]; then
+      exec swaylock -f -i "$HOME/.config/aegis/lock-bg.png"
+    else
+      exec swaylock -f -c 0a0e24
+    fi
+    ;;
+  lock-and-desktop)
+    # Called by sway autostart: lock first, then the desktop bar + widgets.
+    # The lock runs as a layer-shell overlay on top of sway; unlocking
+    # returns here and the desktop shell starts.
+    if [ -n "${SWAYSOCK:-}" ] || pgrep -u "$USER" sway >/dev/null 2>&1; then
+      AEGIS_TEST_UNLOCK="${AEGIS_TEST_UNLOCK:-0}" aegis-shell --lock
+      exec aegis-shell --desktop
+    else
+      echo "aegis-gui --lock-and-desktop must run inside a sway session." >&2; exit 1
+    fi
+    ;;
+  restart-shell)
+    pkill -u "$USER" -f "aegis-shell --desktop" 2>/dev/null || true
+    sleep 1
+    exec aegis-shell --desktop
+    ;;
+  window|fullscreen)
+    if pgrep -u "$USER" sway >/dev/null 2>&1; then
+      echo "GUI is already running. Use aegis-gui --stop to stop it."
+      exit 0
+    fi
+    command -v sway >/dev/null 2>&1 || { echo "ERROR: sway is not installed in this image." >&2; exit 1; }
+    if [ "$MODE" = "fullscreen" ]; then
+      echo "Starting AegisOS GUI (sway, fullscreen request: largest mode on session start)..."
+      mkdir -p "$HOME/.config/sway"
+      printf 'output * mode 1920x1080\n' > "$HOME/.config/sway/fullscreen.conf"
+    else
+      rm -f "$HOME/.config/sway/fullscreen.conf"
+      echo "Starting AegisOS GUI (sway + aegis-shell)..."
+    fi
+    echo "Tip: quit the GUI with Super+Shift+E, or run aegis-gui --stop from another console."
+    echo "Web console stays at http://127.0.0.1:8000."
+    # sway needs a seat: run it on the current tty when possible; under
+    # QEMU serial login, sway still takes the DRM device directly.
+    exec sway -c "$HOME/.config/sway/config"
+    ;;
+esac
