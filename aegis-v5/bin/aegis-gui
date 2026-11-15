@@ -49,6 +49,49 @@ for a in "$@"; do
   esac
 done
 
+# Preflight: sway needs a real VT/seat — a serial console, SSH session or
+# WSL terminal window has no display for it, and sway then dies after
+# ~12 s of libseat errors ("Could not open target tty", "Failed to start
+# a DRM session"). Fail fast with a clear message instead.
+# Skipped when already inside a sway session (SWAYSOCK/WAYLAND_DISPLAY
+# set — e.g. sway autostart calls --lock-and-desktop, keybinds call
+# --lock) and for non-GUI modes (--stop/--help exit during arg parsing;
+# --restart-shell targets the running session).
+check_gui_seat() {
+  if [ -n "${SWAYSOCK:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    return 0
+  fi
+  local tty_name
+  # NB: a failing tty prints "not a tty" on stdout too, so capture it
+  # with stdout redirected away and fall back explicitly.
+  tty_name=$(tty 2>/dev/null) || tty_name="not a tty"
+  case "$tty_name" in
+    /dev/tty[0-9]*)
+      return 0 ;;  # real virtual terminal: sway can take the seat here
+    /dev/ttyS*|/dev/pts/*|"not a tty")
+      cat >&2 <<'EOF'
+aegis-gui: no graphical display here — sway needs the VM's own display.
+This terminal is a serial console / remote terminal, which has no screen,
+so the GUI cannot start from it (sway would fail with libseat errors).
+To see the desktop instead:
+  * From WSL: stop QEMU and relaunch with -vnc :1, connect a VNC viewer
+    on Windows to localhost:5901, log in and run aegis-gui on the VM's screen.
+  * In VirtualBox: boot the image there and run aegis-gui from the VM's
+    own display (tty1).
+EOF
+      exit 1 ;;
+    *)
+      # Unknown terminal type (e.g. /dev/tty without a number): do not
+      # guess — let sway try, and the shell's own no-display message
+      # covers a missing display.
+      return 0 ;;
+  esac
+}
+
+case "$MODE" in
+  window|fullscreen|lock|secure-lock|lock-and-desktop) check_gui_seat ;;
+esac
+
 # Theme: the clean build's chroot colours step can fail under fakechroot
 # (libjpeg loader cache), even though Pillow + libjpeg are in the image.
 # Regenerate the theme on first GUI start if it is missing.
@@ -123,8 +166,8 @@ case "$MODE" in
     fi
     echo "Tip: quit the GUI with Super+Shift+E, or run aegis-gui --stop from another console."
     echo "Web console stays at http://127.0.0.1:8000."
-    # sway needs a seat: run it on the current tty when possible; under
-    # QEMU serial login, sway still takes the DRM device directly.
+    # The preflight above already rejected serial/remote terminals:
+    # sway needs a real VT seat, which only the VM's own display has.
     exec sway -c "$HOME/.config/sway/config"
     ;;
 esac

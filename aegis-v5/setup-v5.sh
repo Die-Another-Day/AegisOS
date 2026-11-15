@@ -35,9 +35,13 @@ chmod 644 /etc/systemd/system/aegis.service /etc/systemd/system/aegis-labapp.ser
 mkdir -p /etc/systemd/system-preset
 printf 'disable aegis-labapp.service\ndisable aegis-ssh-lab.service\n' > /etc/systemd/system-preset/00-aegis-lab.preset
 systemctl disable aegis-labapp.service aegis-ssh-lab.service 2>/dev/null || true
-for h in aegis-lab aegis-ir aegis-fim aegis-lab-reset-flags aegis-gui aegis-status aegis-logs aegis-net aegis-drivers; do
+for h in aegis-lab aegis-ir aegis-fim aegis-lab-reset-flags aegis-gui aegis-status aegis-logs aegis-net aegis-drivers aegis-update; do
   cp "$P/bin/$h" "/usr/local/bin/$h"; chmod 755 "/usr/local/bin/$h"
 done
+# Version file + updater state dirs (v5.0.2; images before it had no version file)
+mkdir -p /var/lib/aegis/update /var/lib/aegis/backup
+if [ -f "$P/VERSION" ]; then cp "$P/VERSION" /etc/aegis-version; else printf '5.0\n' > /etc/aegis-version; fi
+chmod 644 /etc/aegis-version  # analyst must be able to read it for `aegis-update check`
 # Saral 0.3.0 (NEW in v5 — was never in the v4 image)
 mkdir -p /usr/local/lib/saral/libs
 cp "$P/saral/saral.py" /usr/local/bin/saral; chmod 755 /usr/local/bin/saral

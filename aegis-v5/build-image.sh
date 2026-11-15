@@ -213,7 +213,7 @@ fi  # end REUSE=0 configure+setup block
 
 # --- Install ALL aegis-* CLI helpers (always, from $SRC/bin, so none is stale)
 mkdir -p "$ROOTFS/usr/local/bin"
-for h in aegis-gui aegis-status aegis-logs aegis-net aegis-drivers aegis-lab aegis-ir aegis-fim aegis-lab-reset-flags; do
+for h in aegis-gui aegis-status aegis-logs aegis-net aegis-drivers aegis-lab aegis-ir aegis-fim aegis-lab-reset-flags aegis-update; do
   if [ -f "$SRC/bin/$h" ]; then cp "$SRC/bin/$h" "$ROOTFS/usr/local/bin/$h"; chmod 755 "$ROOTFS/usr/local/bin/$h";
   else die "missing helper in v5 folder: bin/$h"; fi
 done
@@ -261,6 +261,10 @@ chmod 755 "$ROOTFS/usr/share/aegis" "$ROOTFS/usr/share/aegis/wallpapers" \
   "$ROOTFS/usr/local/lib/aegis-shell" "$ROOTFS/usr/local/lib/saral" "$ROOTFS/usr/local/lib/saral/libs"
 chmod 644 "$ROOTFS/usr/share/aegis/wallpapers/"*.png "$ROOTFS/usr/local/lib/saral/libs/"*.py
 chmod 644 "$ROOTFS/usr/local/lib/saral/libs/greet_bridge/"* 2>/dev/null || true
+# --- Version file + updater state dirs (v5.0.2; older images had no version file)
+mkdir -p "$ROOTFS/var/lib/aegis/update" "$ROOTFS/var/lib/aegis/backup"
+[ -f "$SRC/VERSION" ] && cp "$SRC/VERSION" "$ROOTFS/etc/aegis-version" || printf '5.0\n' > "$ROOTFS/etc/aegis-version"
+chmod 644 "$ROOTFS/etc/aegis-version"  # build host umask is 0007; analyst must be able to read it for `aegis-update check`
 # --- Lab DB/flags + FIM manifest + theme, inside the chroot -----------------
 # labapp.init_db() creates the SQLite DB + flag3 (random); flag2 is
 # generated the same way aegis-lab-reset-flags does it. FIM manifest is
@@ -458,17 +462,18 @@ log "lab-off gate passed (no lab wants-symlinks in packed filesystem)"
 #   compatibility check and this gate's own search pattern).
 # Binary artifacts are excluded from the text gate (they cannot be
 # line-filtered for the env-var exception; the image contents are
-# verified separately on the rootfs before packing).
+# verified separately on the rootfs before packing). *.test copies of
+# an image are excluded for the same reason as *.img.
 # Everything that ships INTO the image is gated: server.py, labapp.py,
 # bin/*, units, wayland/*, frontend/*, saral/*, setup-v5.sh, guest scripts.
 if grep -ri "secureos" "$SRC" --exclude-dir=.build --exclude-dir=logs --exclude-dir=screenshots --exclude-dir=__pycache__ \
      --exclude=audit-v4.md --exclude=research-hyprland.md --exclude=README-v5.md --exclude=build-image.sh \
-     --exclude="*.img" --exclude="*.sha256" --exclude="*.pyc" \
+     --exclude="*.img" --exclude="*.test" --exclude="*.sha256" --exclude="*.pyc" \
      | grep -v "SECUREOS_BIND_IP" | grep -v "SECUREOS_ALLOW_PUBLIC" | grep -q .; then
   echo "[build] ERROR: rename gate failed — 'secureos' leftovers (excluding the env-var exception):" >&2
   grep -ri "secureos" "$SRC" --exclude-dir=.build --exclude-dir=logs --exclude-dir=screenshots --exclude-dir=__pycache__ \
      --exclude=audit-v4.md --exclude=research-hyprland.md --exclude=README-v5.md --exclude=build-image.sh \
-     --exclude="*.img" --exclude="*.sha256" --exclude="*.pyc" \
+     --exclude="*.img" --exclude="*.test" --exclude="*.sha256" --exclude="*.pyc" \
      | grep -v "SECUREOS_BIND_IP" | grep -v "SECUREOS_ALLOW_PUBLIC" >&2
   exit 1
 fi

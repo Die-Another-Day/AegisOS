@@ -45,12 +45,14 @@ The GUI starts only when you run `aegis-gui`.
 > output dir to an absolute path in `build-image.sh`; re-verified in
 > runs 6 and 7.
 
-## Current image (2026-11-14, REUSE repack run4h + guest-test run 7 + vt-gui-test run 10)
+## Current image (2026-11-15, v5.0.2 — full clean build + REUSE repacks for the updater fixes; guest-test + vt-gui-test + update-test + bootstrap-test all pass)
 
 - `aegis-v5.img` — 5.0 GiB (5120 MiB), clean debootstrap build
-  (REUSE repacks from the same rootfs; never a guest-apply upgrade).
+  (build 3, then REUSE repacks from the same rootfs for the
+  `aegis-update` fixes only; never a guest-apply upgrade).
+  `/etc/aegis-version` reads `5.0.2`; `aegis-update` installed.
 - SHA256:
-  `4f52ebaf0d2d98bff6503bf13adbb5ebbfef852c02c18639b2ff0df437ebf64a`
+  `6da6fc6387adf52874c58fe524392ac512064101c55bb2c4a8a24b6993c7677d`
   (also in `aegis-v5.img.sha256`; the shipped image is never booted
   directly — every test boots a `*.test` copy, so the hash stays valid
   after testing).
@@ -255,6 +257,31 @@ aegis-wallpaper sunset                      # switch wallpaper, widgets recolour
 aegis-shell --launcher                      # radial launcher (Super+Space in sway)
 ```
 
+## GUI — where it can and cannot start (v5.0.2)
+
+`aegis-gui` starts sway, and sway needs a real VT/seat — the VM's own
+display. It can NEVER start from a serial console, an SSH session, or a
+WSL terminal window: there is no screen there for sway to draw on.
+Since v5.0.2 `aegis-gui` detects that case before launching sway and
+fails fast (well under a second) with a clear message instead of ~12 s
+of libseat errors. The message names the two working paths:
+
+* **From WSL:** stop QEMU and relaunch with `-vnc :1`, connect a VNC
+  viewer on Windows to `localhost:5901`, log in and run `aegis-gui`
+  on the VM's screen.
+* **In VirtualBox:** boot the image there and run `aegis-gui` from the
+  VM's own display (tty1). v5.0.1 also made the shell wait up to 10 s
+  for a display and made `aegis-gui` wait up to 15 s for sway to report
+  an active output, covering the slow VMSVGA buffer-allocation race
+  seen on VirtualBox. A VirtualBox run of the fixed image is still
+  unproven from this sandbox (no VirtualBox/KVM here) — the user's
+  machine is the decisive test.
+
+`aegis-gui --stop` / `--help` / `--restart-shell` are unaffected and
+still work from any terminal. `aegis-shell` on its own still fails
+fast with its own one-line no-display message (v5.0.1) when run with
+no display at all.
+
 Lab (same as v4, renamed):
 
 ```bash
@@ -268,6 +295,48 @@ sudo aegis-fim --init | --check
 
 Full headless regression (lab enable → SQLi/SSH/plugin flags → alerts →
 IR → reset → stop): `python3 guest-test-v5.py aegis-v5.img logs/guest-test-v5.log`
+
+## Updating (v5.0.2 — no more full re-downloads for small fixes)
+
+Every release before v5.0.2 shipped as a 5 GB image, so even a 3-file
+fix meant downloading all of it again. From v5.0.2 the system updates
+itself in place:
+
+```bash
+aegis-update check          # installed version (from /etc/aegis-version) vs latest GitHub release
+sudo aegis-update apply     # patch bundle if the release carries one, else full image
+```
+
+- **Patch bundle** (`<tag>-patch.tar.gz` on the release): a tar.gz with
+  `manifest.json` (release tag, files with target paths + SHA256 each,
+  optional `post_apply` commands) and the changed files only. The
+  updater verifies every file's SHA256 *before* applying anything,
+  backs up every replaced file to `/var/lib/aegis/backup/<old-version>/`,
+  applies, runs the post-apply hooks (allowlisted: `systemctl
+  restart/reload` of an `aegis-*.service` unit, or
+  `aegis-lab-reset-flags`), then writes the new version to
+  `/etc/aegis-version`. Any hash mismatch or disallowed hook refuses the
+  whole bundle and nothing is applied.
+- **Full-image fallback**: if a release has no patch bundle, the updater
+  downloads all `aegis-v5.img.xz.part-*` + `SHA256SUMS.txt` into
+  `/var/lib/aegis/update/<tag>/`, verifies every checksum, reassembles
+  and integrity-checks the `.xz` — then **stops**. It never overwrites
+  the disk the running system booted from; the printed instructions say
+  how to flash the new image to USB or attach it as a new VM disk.
+- `check` works as any user and handles no-network with a clear
+  message; `apply` needs root (`sudo`). No new packages: curl, python3,
+  tar, sha256sum, coreutils only.
+- Systems on v5.0.0/v5.0.1 have no updater and no `/etc/aegis-version`
+  (they report as 5.0). One-time bootstrap, run inside the VM:
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/Die-Another-Day/AegisOS/main/aegis-v5/bootstrap-update.sh -o /tmp/bootstrap-update.sh
+  sudo bash /tmp/bootstrap-update.sh
+  ```
+  It downloads the v5.0.1 fix files (`aegis-shell`, `aegis-gui`, the
+  serial test) plus `aegis-update` from GitHub main, verifies every
+  SHA256 against hashes baked into the script, installs them, and writes
+  `/etc/aegis-version` as `5.0.1`. Any hash mismatch aborts with nothing
+  installed. After that, `aegis-update check` works normally.
 
 ## What is NOT proven
 
@@ -415,9 +484,13 @@ IR → reset → stop): `python3 guest-test-v5.py aegis-v5.img logs/guest-test-v
 
 `build-image.sh`, `setup-v5.sh`, `server.py`, `labapp.py`,
 `v5-console.js`, `aegis.service`, `aegis-labapp.service`,
-`aegis-ssh-lab.service`, `bin/aegis-{lab,ir,fim,lab-reset-flags,gui,status,logs,net,drivers}`,
-`run-qemu.sh`, `run-qemu-gui.sh`, `guest-test-v5.py`,
-`guest-setup-v5.py`, `host-ssh-flag.py`, `vt-gui-test-v5.py`
+`aegis-ssh-lab.service`, `bin/aegis-{lab,ir,fim,lab-reset-flags,gui,status,logs,net,drivers,update}`,
+`VERSION` (5.0.2), `bootstrap-update.sh` (one-time updater install for
+v5.0.0/v5.0.1 systems), `run-qemu.sh`, `run-qemu-gui.sh`, `guest-test-v5.py`,
+`guest-setup-v5.py`, `host-ssh-flag.py`, `vt-gui-test-v5.py`,
+`serial-shell-test-v501.py` (serial-console no-display test),
+`update-test-v502.py` (updater test: check, patch apply, tampered-bundle
+refusal, full-image fallback)
 (graphical verification driver — boots a copy, logs in on tty1,
 gates every shot on live process/window state),
 `gui-test-v5.py` (SUPERSEDED by the vt driver — its serial-console
