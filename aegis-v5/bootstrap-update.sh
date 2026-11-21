@@ -29,12 +29,13 @@ fi
 # src-path | destination | sha256 (hashes of the v5.0.1 files on main, commit
 # cc3cd36, plus bin/aegis-update as written for v5.0.2 — re-compute the
 # hashes if any of these files changes. NOTE: the aegis-gui hash below is
-# the v5.0.2 file (preflight guard added after cc3cd36), so a bootstrapped
-# system also gets the serial-console preflight; the version file still
-# reads 5.0.1, so `aegis-update` may later offer the v5.0.2 patch again —
+# the v5.0.3 file (preflight guard from v5.0.2 + WLR_NO_HARDWARE_CURSORS
+# cursor fix), so a bootstrapped system also gets the serial-console
+# preflight and the visible cursor; the version file still reads 5.0.1,
+# so `aegis-update` may later offer the v5.0.2/v5.0.3 update again —
 # re-applying identical files, harmless.)
 FILES="aegis-v5/wayland/aegis-shell.py|/usr/local/bin/aegis-shell|a862c7aa67987f82f5dd94e38fd4fe9c0c53b0cda64a74c4033cdfe49ea60edb
-aegis-v5/bin/aegis-gui|/usr/local/bin/aegis-gui|9c96c90f343f7945b4a71f95a0db59537fa29a0509ce356243ab42d02cc2058d
+aegis-v5/bin/aegis-gui|/usr/local/bin/aegis-gui|b92cc53595ef7cca9f26f9779b976dc15f82b20c34797ca2bd8ff154e62dbd98
 aegis-v5/serial-shell-test-v501.py|/usr/local/bin/serial-shell-test-v501.py|53e0703bdd1400d7a0e36ba805ee2a5ba71b1a3e13b42a50b7f3b806b5154a6b
 aegis-v5/bin/aegis-update|/usr/local/bin/aegis-update|a17a47bb25504514557362e13e87aa802e9411f2e2af53cf3494e79796daea63"
 
@@ -64,16 +65,38 @@ $FILES
 EOF
 
 echo "bootstrap-update: all hashes verified — installing ..."
+# v5.0.3: verify EVERY install, file by file. The old loop printed
+# "installed ..." unconditionally and finished with "done" even when
+# cp/chmod failed — on a corrupted filesystem ("Structure needs
+# cleaning") two of four files failed to install and the script still
+# claimed success. Now a failed copy, a failed chmod, or a hash
+# mismatch AFTER install aborts everything with a clear error naming
+# the file, no "done" line, and a non-zero exit.
+install_failed=0
 while IFS='|' read -r src dest hash; do
   [ -n "$src" ] || continue
   # cp follows the /usr/local/bin/aegis-shell symlink, so the real file
   # under /usr/local/lib/aegis-shell/ is what gets replaced.
-  cp "$TMP/$(basename "$src")" "$dest"
-  chmod 755 "$dest"
-  echo "  installed $dest"
+  if ! cp "$TMP/$(basename "$src")" "$dest"; then
+    echo "bootstrap-update: INSTALL FAILED for $src -> $dest (cp failed — check the disk, e.g. filesystem corruption) — aborting, system is NOT updated" >&2
+    install_failed=1; break
+  fi
+  if ! chmod 755 "$dest"; then
+    echo "bootstrap-update: INSTALL FAILED for $dest (chmod failed — check the disk) — aborting, system is NOT updated" >&2
+    install_failed=1; break
+  fi
+  got="$(sha256sum "$dest" 2>/dev/null | cut -d' ' -f1)"
+  if [ "$got" != "$hash" ]; then
+    echo "bootstrap-update: INSTALL FAILED for $dest (installed file hash $got != expected $hash — the write did not land) — aborting, system is NOT updated" >&2
+    install_failed=1; break
+  fi
+  echo "  installed $dest (verified)"
 done <<EOF
 $FILES
 EOF
+if [ "$install_failed" != "0" ]; then
+  exit 1
+fi
 
 printf '5.0.1\n' > /etc/aegis-version
 chmod 644 /etc/aegis-version

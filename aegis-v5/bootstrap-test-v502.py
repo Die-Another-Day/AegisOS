@@ -38,7 +38,7 @@ HOST_URL = f"http://10.0.2.2:{PORT}"
 
 EXPECTED = {
     "aegis-v5/wayland/aegis-shell.py": "a862c7aa67987f82f5dd94e38fd4fe9c0c53b0cda64a74c4033cdfe49ea60edb",
-    "aegis-v5/bin/aegis-gui": "9c96c90f343f7945b4a71f95a0db59537fa29a0509ce356243ab42d02cc2058d",  # v5.0.2 preflight guard
+    "aegis-v5/bin/aegis-gui": "b92cc53595ef7cca9f26f9779b976dc15f82b20c34797ca2bd8ff154e62dbd98",  # v5.0.3 preflight guard + WLR_NO_HARDWARE_CURSORS cursor fix
     "aegis-v5/serial-shell-test-v501.py": "53e0703bdd1400d7a0e36ba805ee2a5ba71b1a3e13b42a50b7f3b806b5154a6b",
     "aegis-v5/bin/aegis-update": "a17a47bb25504514557362e13e87aa802e9411f2e2af53cf3494e79796daea63",
 }
@@ -155,6 +155,36 @@ if ok:
     for rel, h in EXPECTED.items():
         check(re.escape(h).encode(), f"installed hash matches for {rel}")
     check(rb"Installed version: 5\.0\.1", "aegis-update check reports 5.0.1")
+if ok:
+    # Run 3 (v5.0.3): install failure must NOT print "done".
+    # Simulate a corrupted/unwritable destination: a directory sits
+    # where /usr/local/bin/aegis-update should be. (cp copies INTO
+    # the directory, so the failure surfaces in the post-install
+    # SHA256 check — sha256sum on a directory path fails.) The good
+    # run installed a real file there, so rm it first or mkdir fails
+    # with "File exists" and the simulation never happens. Also
+    # remove the version file first so a false "done" would be visible
+    # (a failed run must leave it absent). NOTE: buf accumulates the
+    # whole run, and run 2 legitimately printed "done" — so scope
+    # these checks to the run-3 segment only (buf from seg_start on).
+    seg_start = len(buf)
+    send(f"echo MARK_BS_INSTALLFAIL; {SUDO} rm -f /etc/aegis-version; {SUDO} rm -f /usr/local/bin/aegis-update; {SUDO} mkdir -p /usr/local/bin/aegis-update; curl -fsSL {HOST_URL}/aegis-v5/bootstrap-update.sh -o /tmp/bootstrap-update.sh && {SUDO} env AEGIS_RAW_BASE={HOST_URL} bash /tmp/bootstrap-update.sh; echo BS_INSTALLFAIL_RC=$?; ls /etc/aegis-version 2>&1\n")
+    ok &= drain("installfail", timeout=240)
+    seg = buf[seg_start:]
+    def check_seg(pat, label):
+        global ok
+        found = re.search(pat, seg)
+        print(f"[bootstrap-test] {'PASS' if found else 'FAIL'} {label}: {pat}", flush=True)
+        ok = ok and bool(found)
+        return bool(found)
+    check_seg(rb"INSTALL FAILED.*aegis-update", "install failure names the file")
+    check_seg(rb"BS_INSTALLFAIL_RC=1", "install-failure run exit non-zero")
+    check_seg(rb"cannot access '/etc/aegis-version': No such file or directory", "install-failure run writes no version file")
+    if re.search(rb"bootstrap-update: done", seg):
+        print("[bootstrap-test] FAIL install-failure run printed 'done'", flush=True)
+        ok = False
+    else:
+        print("[bootstrap-test] PASS install-failure run printed no 'done'", flush=True)
 if ok:
     send("echo MARK_BS_DONE; echo secure | sudo -S poweroff\n")
     drain("done")

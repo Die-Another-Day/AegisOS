@@ -42,7 +42,8 @@ IMG = TEST_IMG
 SHOTS = HERE / "screenshots"
 SHOTS.mkdir(exist_ok=True)
 MON_SOCK = "/tmp/aegis-v5-vt-mon.sock"
-for p in (MON_SOCK,):
+QMP_SOCK = "/tmp/aegis-v5-vt-qmp.sock"
+for p in (MON_SOCK, QMP_SOCK):
     try: os.unlink(p)
     except OSError: pass
 logf = open(LOG, "wb", buffering=0)
@@ -57,8 +58,11 @@ q = subprocess.Popen(
      "-netdev", "user,id=net0,hostfwd=tcp::18000-:8000",
      "-device", "e1000,netdev=net0",
      "-device", "virtio-vga",
+     "-device", "qemu-xhci",
+     "-device", "usb-tablet",
      "-display", "vnc=:1",
-     "-serial", "stdio", "-monitor", f"unix:{MON_SOCK},server,nowait"],
+     "-serial", "stdio", "-monitor", f"unix:{MON_SOCK},server,nowait",
+     "-qmp", f"unix:{QMP_SOCK},server,nowait"],
     stdin=slave, stdout=slave, stderr=slave, close_fds=True)
 os.close(slave)
 buf = b""
@@ -89,6 +93,35 @@ def drain(label):
     m = f"VTDRAIN{_drain_n[0]}_{label}"
     send(f"echo {m}\n")
     return wait_for(m.encode(), 60, f"drain {label}")
+
+def mouse_move(x, y):
+    """Move the pointer to ABSOLUTE output coordinates via QMP
+    input-send-event (usb-tablet, 0..32767 axis range).
+    v5.0.3: the cursor must be VISIBLE in the screenshots — park it
+    somewhere it cannot hide behind a widget, then screenshot.
+    (HMP mouse_move is RELATIVE and is ignored by the absolute
+    usb-tablet, so it cannot place the pointer — QMP abs events are
+    the correct call: {"type": "abs", "data": {"axis": "x",
+    "value": ...}}.)"""
+    import json as _json
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(20); s.connect(QMP_SOCK)
+        f = s.makefile("rw", buffering=1, encoding="utf-8")
+        f.readline()  # greeting
+        f.write(_json.dumps({"execute": "qmp_capabilities"}) + "\n"); f.flush()
+        f.readline()  # return
+        ax = int(x / 1280 * 32767)
+        ay = int(y / 800 * 32767)
+        f.write(_json.dumps({"execute": "input-send-event", "arguments": {"events": [
+            {"type": "abs", "data": {"axis": "x", "value": ax}},
+            {"type": "abs", "data": {"axis": "y", "value": ay}}]}}) + "\n"); f.flush()
+        resp = f.readline()
+        s.close()
+        print(f"[vt-test] mouse moved to {x},{y} (abs {ax},{ay}): {resp.strip()}", flush=True)
+        time.sleep(1.5)
+    except Exception as e:
+        emit(f"\n[vt-test] mouse_move FAILED: {e}\n".encode())
 
 def screendump(name):
     """Ask the QEMU monitor for a screendump; convert PPM -> PNG with Pillow."""
@@ -182,6 +215,7 @@ if ok:
         send("swaymsg -t get_outputs 2>&1 | head -n 20; echo ---GUILOG---; cat /tmp/gui.log 2>&1 | head -n 40\n")
         ok &= drain("lock")
 if ok:
+    mouse_move(560, 625)  # on the lock-screen password row
     screendump("01-lock-screen")
     send("pkill -f 'aegis-shell --lock'; echo LOCK_KILLED\n")
     time.sleep(12)
@@ -190,6 +224,7 @@ if ok:
     send("echo MARK_VT_DESKTOP; pgrep -af 'aegis-shell|sway'; echo ---GUILOG-TAIL---; tail -n 60 /tmp/gui.log 2>&1\n")
     ok &= drain("desktop")
 if ok:
+    mouse_move(640, 400)  # centre of the starfield desktop
     screendump("02-desktop")
     send("export SWAYSOCK=$(ls /run/user/1000/sway-ipc.*.sock | head -1); echo SWAYSOCK=$SWAYSOCK\n")
     send("aegis-wallpaper sunset; echo WALLPAPER_RC=$?; grep accent ~/.config/aegis/theme.json\n")
@@ -204,11 +239,13 @@ if ok:
         ok &= shell_has(rb"swaybg -o \* -i", "swaybg-alive")
         time.sleep(8)
 if ok:
+    mouse_move(640, 400)
     screendump("03-desktop-sunset")
     send("swaymsg exec 'aegis-shell --launcher'; echo LAUNCHER_SENT\n")
     time.sleep(10)
     ok &= shell_has(rb"aegis-shell --launcher", "launcher-alive")
 if ok:
+    mouse_move(640, 400)
     screendump("04-launcher")
     send("echo MARK_VT_DONE; pkill -f 'aegis-shell --launcher' 2>/dev/null; echo secure | sudo -S poweroff\n")
     drain("done")

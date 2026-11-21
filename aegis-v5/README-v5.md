@@ -282,6 +282,30 @@ still work from any terminal. `aegis-shell` on its own still fails
 fast with its own one-line no-display message (v5.0.1) when run with
 no display at all.
 
+## Mouse cursor + QEMU display + clean shutdown (v5.0.3)
+
+* **No cursor on the lock screen (fixed v5.0.3).** The pointer was
+  invisible on both QEMU virtio-vga and VirtualBox VMSVGA, so the
+  lock-screen password box could not be clicked. The Adwaita cursor
+  theme files were already in the image — the cause was wlroots
+  failing to use the DRM hardware-cursor plane with the pixman
+  renderer (`Failed to pick cursor format` / `Failed to render
+  cursor buffer` in the sway log). `aegis-gui` now sets
+  `WLR_NO_HARDWARE_CURSORS=1` so wlroots draws the pointer into the
+  framebuffer itself, and `sway-config` sets
+  `seat * xcursor_theme Adwaita 24` explicitly.
+* **QEMU needs a DRM-capable virtual GPU.** The default VGA device
+  has no DRM device and sway fails with `Failed to open any DRM
+  device` / `Unable to create backend`. Working launch:
+  `qemu-system-x86_64 -m 2048 -hda aegis-v5.img -vga virtio -vnc :1`
+  (then a VNC viewer to `localhost:5901`).
+* **Always shut the VM down cleanly** (`sudo poweroff`). A hard
+  power-off (closing the VM window, `kill` on QEMU) can corrupt the
+  ext4 filesystem — the guest then reports `Structure needs
+  cleaning` and files fail to install or update. No updater can fix
+  a corrupted filesystem; the only repair is `fsck` from outside
+  the guest or a fresh image.
+
 Lab (same as v4, renamed):
 
 ```bash
@@ -485,7 +509,7 @@ sudo aegis-update apply     # patch bundle if the release carries one, else full
 `build-image.sh`, `setup-v5.sh`, `server.py`, `labapp.py`,
 `v5-console.js`, `aegis.service`, `aegis-labapp.service`,
 `aegis-ssh-lab.service`, `bin/aegis-{lab,ir,fim,lab-reset-flags,gui,status,logs,net,drivers,update}`,
-`VERSION` (5.0.2), `bootstrap-update.sh` (one-time updater install for
+`VERSION` (5.0.3), `bootstrap-update.sh` (one-time updater install for
 v5.0.0/v5.0.1 systems), `run-qemu.sh`, `run-qemu-gui.sh`, `guest-test-v5.py`,
 `guest-setup-v5.py`, `host-ssh-flag.py`, `vt-gui-test-v5.py`,
 `serial-shell-test-v501.py` (serial-console no-display test),

@@ -112,6 +112,7 @@ apt-get install -y --no-install-recommends \
   netbase ifupdown isc-dhcp-client kmod e2fsprogs util-linux \
   sway swaybg swayidle swaylock xwayland waybar \
   libgtk-layer-shell0 gir1.2-gtklayershell-0.1 foot grim slurp mako-notifier playerctl \
+  adwaita-icon-theme \
   libgl1-mesa-dri mesa-utils-bin \
   firefox-esr \
   network-manager wpasupplicant wireless-tools iw \
@@ -210,6 +211,13 @@ fi  # end REUSE=0 configure+setup block
 # centred on top of each other (v5 repack #3 screenshots). Fail the build
 # if the typelib is absent so a broken desktop can never ship again.
 [ -f "$ROOTFS/usr/lib/x86_64-linux-gnu/girepository-1.0/GtkLayerShell-0.1.typelib" ] || die "GtkLayerShell typelib missing from rootfs (gir1.2-gtklayershell-0.1 not installed)"
+# Cursor theme check (v5.0.3): the pointer was invisible on both QEMU
+# virtio-vga and VirtualBox VMSVGA because wlroots could not use the DRM
+# hardware-cursor plane with the pixman renderer ("Failed to pick cursor
+# format"). aegis-gui now forces software cursors, but the theme files
+# themselves must exist — fail the build if Adwaita's left_ptr is absent
+# so a cursor-less desktop can never ship again.
+[ -f "$ROOTFS/usr/share/icons/Adwaita/cursors/left_ptr" ] || die "Adwaita cursor theme missing from rootfs (adwaita-icon-theme not installed)"
 
 # --- Install ALL aegis-* CLI helpers (always, from $SRC/bin, so none is stale)
 mkdir -p "$ROOTFS/usr/local/bin"

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Updater test for AegisOS v5.0.2.
+"""Updater test for AegisOS v5.0.3.
 
 Boots a COPY of the image in QEMU (serial console, no display) and
 exercises aegis-update end to end. Serves all test fixtures from a local
@@ -9,7 +9,7 @@ HTTP server on the host (guest reaches it at 10.0.2.2:18080):
      the HTTP code. If the guest cannot reach it, that is reported as a
      finding, not faked.
   2. `aegis-update check` against the REAL API (latest release at test
-     time is v5.0.1; installed is 5.0.2, so expect "newer than latest").
+     time is v5.0.2; installed is 5.0.3, so expect "newer than latest").
      This step is RECORDED, not gating: this VM's QEMU user networking
      has no external egress (proven by net-probe-v502: DNS gets no
      answer, TCP to the outside fails; only the 10.0.2.2 host channel
@@ -19,20 +19,20 @@ HTTP server on the host (guest reaches it at 10.0.2.2:18080):
      same code path against the fake release (v5.0.5, full image only).
   3. Patch apply: `sudo aegis-update apply --url
      http://10.0.2.2:18080/test-patch.tar.gz` — a locally built bundle
-     (version 5.0.3) that writes /etc/aegis-test-patch.txt and restarts
+     (version 5.0.4) that writes /etc/aegis-test-patch.txt and restarts
      aegis.service. Verifies: file contents, backup under
-     /var/lib/aegis/backup/5.0.2/, version file reads 5.0.3, console
+     /var/lib/aegis/backup/5.0.3/, version file reads 5.0.4, console
      still answers /api/health after the restart.
   4. Tampered bundle: same manifest, one payload byte flipped —
      `apply --url` must refuse it, change nothing, and leave the version
-     at 5.0.3.
+     at 5.0.4.
   5. Non-root apply must refuse (exit 2, "needs root").
   6. Full-image fallback: `sudo env AEGIS_API_BASE=http://10.0.2.2:18080
      aegis-update apply` against a FAKE release (v5.0.5, no patch asset,
      two tiny parts + SHA256SUMS.txt served locally). Verifies: parts
      downloaded + checksummed, reassembled .xz passes `xz -t`, the
      updater prints STOP with flashing instructions and does NOT touch
-     the booted disk, version stays 5.0.3.
+     the booted disk, version stays 5.0.4.
 
 Usage: update-test-v502.py <image> <logfile>
 """
@@ -63,15 +63,15 @@ if SERVE.exists():
 SERVE.mkdir(parents=True)
 
 def make_bundle(path, version, tag, tamper=False, post_apply=None):
-    payload = b"patch-ok v5.0.3\n"
+    payload = b"patch-ok v5.0.4\n"
     if tamper:
-        payload = b"patch-ok v5.0.3 tampered\n"  # manifest keeps the good hash
+        payload = b"patch-ok v5.0.4 tampered\n"  # manifest keeps the good hash
     manifest = {
         "format": "aegis-patch/1",
         "tag": tag,
         "version": version,
         "files": [{"path": "etc/aegis-test-patch.txt",
-                   "sha256": hashlib.sha256(b"patch-ok v5.0.3\n").hexdigest(),
+                   "sha256": hashlib.sha256(b"patch-ok v5.0.4\n").hexdigest(),
                    "mode": "644"}],
         "post_apply": post_apply or ["systemctl restart aegis.service"],
     }
@@ -84,7 +84,7 @@ def make_bundle(path, version, tag, tamper=False, post_apply=None):
         ti.size = len(payload)
         tf.addfile(ti, io.BytesIO(payload))
 
-make_bundle(SERVE / "test-patch.tar.gz", "5.0.3", "v5.0.3")
+make_bundle(SERVE / "test-patch.tar.gz", "5.0.4", "v5.0.4")
 make_bundle(SERVE / "test-patch-tampered.tar.gz", "5.0.4", "v5.0.4", tamper=True)
 
 # Fake full image: a tiny xz, split into 2 parts, served with checksums.
@@ -207,14 +207,14 @@ if ok:
               "(environment: QEMU user-net has no external egress here; "
               "real-API check proven via fake API in step 2b instead)", flush=True)
 if ok:
-    # 2. check against the real API (installed 5.0.2 vs latest v5.0.1).
+    # 2. check against the real API (installed 5.0.3 vs latest v5.0.2).
     # Only meaningful if the net step above succeeded; otherwise the
     # updater must print its clear no-network message.
     send("echo MARK_UPD_CHECK; cat /etc/aegis-version; which aegis-update; aegis-update check; echo CHECK_RC=$?\n")
     ok &= drain("check")
-    check(rb"Installed version: 5\.0\.2", "installed version is 5.0.2")
+    check(rb"Installed version: 5\.0\.3", "installed version is 5.0.3")
     if re.search(rb"API_HTTP=200", buf):
-        check(rb"Latest release:\s+v5\.0\.1", "latest release reported as v5.0.1")
+        check(rb"Latest release:\s+v5\.0\.2", "latest release reported as v5.0.2")
         check(rb"newer than the latest release", "check reports installed newer")
     else:
         check(rb"cannot reach the GitHub API", "check fails gracefully with no network")
@@ -234,8 +234,8 @@ if ok:
     send(f"echo MARK_UPD_APPLY; {SUDO} aegis-update apply --url {HOST_URL}/test-patch.tar.gz; echo APPLY_RC=$?; cat /etc/aegis-version; cat /etc/aegis-test-patch.txt; {SUDO} ls -R /var/lib/aegis/backup/; sleep 3; curl -s --max-time 10 http://127.0.0.1:8000/api/health | head -c 300; echo\n")
     ok &= drain("apply", timeout=240)
     check(rb"APPLY_RC=0", "patch apply exit 0")
-    check(rb"patch-ok v5\.0\.3", "patched file has new content")
-    check(rb"/var/lib/aegis/backup/5\.0\.2", "backup dir for 5.0.2 exists")
+    check(rb"patch-ok v5\.0\.4", "patched file has new content")
+    check(rb"/var/lib/aegis/backup/5\.0\.3", "backup dir for 5.0.3 exists")
     check(rb'"ok": true', "console still answers after post_apply restart")
 if ok:
     # 5. Tampered bundle must be refused with nothing changed.

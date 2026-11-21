@@ -109,6 +109,15 @@ export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
 export WLR_RENDERER="${WLR_RENDERER:-pixman}"
 mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
 export WLR_RENDERER_ALLOW_SOFTWARE=1
+# Hardware cursors: with the pixman renderer wlroots cannot pick a cursor
+# format for the DRM cursor plane ("Failed to pick cursor format" /
+# "Failed to render cursor buffer" in the sway log) and the pointer is
+# INVISIBLE — on both QEMU virtio-vga and VirtualBox VMSVGA, proven
+# 2026-11-20. Forcing software cursors makes wlroots draw the pointer
+# into the framebuffer itself, so it is always visible. (The Adwaita
+# cursor theme files were already in the image — the theme was never
+# the problem; the hardware-cursor format was.)
+export WLR_NO_HARDWARE_CURSORS=1
 export MOZ_ENABLE_WAYLAND=1
 
 case "$MODE" in
