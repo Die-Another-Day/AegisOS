@@ -1,0 +1,432 @@
+#!/usr/bin/env python3
+"""aegis-tools — install security tools on AegisOS v6.
+
+  aegis-tools list            show the tools available on this system
+  aegis-tools install <name>  install one on-demand tool
+  aegis-tools help            show this help
+
+Two groups of tools:
+
+  * Debian-packaged — pre-installed in the AegisOS image (nmap, sqlmap,
+    nikto, hydra, wireshark, tshark, tcpdump, john, aircrack-ng). If one
+    is somehow missing, `install` just prints the apt command for it;
+    it never downloads anything itself.
+  * On-demand — NOT in the image (size), fetched from the vendor's
+    official installer when you ask for them:
+      burpsuite  PortSwigger Burp Suite Community Edition, Linux
+                 installer (install4j), installed to /opt/BurpSuiteCommunity
+      zaproxy    OWASP ZAP, official Unix installer (IzPack), installed
+                 to its default location (detected after install;
+                 needs Java 17+, installed via apt if missing)
+
+Checksums: neither vendor publishes a checksum file for these
+installers (PortSwigger publishes no hash at all; the ZAP GitHub
+release carries no .sha256 asset), so verification is: HTTPS download
+from the vendor's own domain, expected file type (shell script) and,
+for ZAP, the byte size reported by the GitHub release API. The
+download URLs are version-less (Burp) or resolved from the GitHub
+latest-release API (ZAP), so a hard-coded hash would rot — the
+script records the size + SHA256 of whatever it downloaded in its
+output instead, so the install is auditable after the fact.
+
+Needs root for `install` (sudo). `list` works as any user. With no
+network, `install` fails with a clear message instead of a
+traceback. Test hook: AEGIS_TOOLS_OFFLINE=1 makes the network check
+fail on purpose (used to exercise the no-network path).
+"""
+import hashlib
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+
+# Debian-packaged tools, pre-installed in the image.
+# name -> (apt package, one-line description)
+DEBIAN_TOOLS = {
+    "nmap": ("nmap",
+             "Network discovery and security auditing"),
+    "sqlmap": ("sqlmap",
+               "Automatic SQL injection and database takeover"),
+    "nikto": ("nikto",
+              "Web server scanner (from Debian non-free)"),
+    "hydra": ("hydra",
+              "Parallelised login cracker"),
+    "wireshark": ("wireshark",
+                  "Network protocol analyser (GUI)"),
+    "tshark": ("tshark",
+               "Network protocol analyser (command line)"),
+    "tcpdump": ("tcpdump",
+                "Command-line packet analyser"),
+    "john": ("john",
+             "John the Ripper password cracker"),
+    "aircrack-ng": ("aircrack-ng",
+                    "802.11 WEP/WPA-PSK key cracking suite"),
+}
+
+# On-demand tools, fetched from the vendor's official installer.
+# name -> dict(url, description, install_dir, marker file proving install)
+ON_DEMAND = {
+    "burpsuite": {
+        "url": "https://portswigger.net/burp/releases/download"
+               "?product=community&type=linux",
+        "description": "Burp Suite Community Edition (PortSwigger)",
+        "install_dir": "/opt/BurpSuiteCommunity",
+        "marker": "/opt/BurpSuiteCommunity/BurpSuiteCommunity",
+    },
+    "zaproxy": {
+        # Resolved at install time from the GitHub latest-release API;
+        # this is the fallback if the API cannot be reached.
+        "url": "https://github.com/zaproxy/zaproxy/releases/download"
+               "/v2.17.0/ZAP_2_17_0_unix.sh",
+        "api": "https://api.github.com/repos/zaproxy/zaproxy/releases/latest",
+        "description": "OWASP ZAP (Zed Attack Proxy)",
+        # Expected install dir; the installer picks its own default,
+        # so after install we search the usual locations instead of
+        # assuming this one (see find_zap_install).
+        "install_dir": "/opt/zaproxy",
+        "marker": "/opt/zaproxy/zap.sh",
+    },
+}
+
+ZAP_API = "https://api.github.com/repos/zaproxy/zaproxy/releases/latest"
+# The ZAP installer is IzPack-based; run it with -q for an
+# unattended install. It picks its own default install directory,
+# so aegis-tools searches the usual locations afterwards instead of
+# assuming one (see find_zap_install).
+# The Burp installer is install4j-based; -q is unattended mode and
+# the install directory comes from a response varfile
+# (sys.installationDir), per PortSwigger's unattended-install docs.
+
+
+def die(msg, code=1):
+    print(f"aegis-tools: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def last_line(text):
+    lines = (text or "").strip().splitlines()
+    return lines[-1] if lines else ""
+
+
+def run(cmd, timeout=120):
+    """Run a command; return (returncode, stdout, stderr) as text."""
+    try:
+        r = subprocess.run(cmd, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, text=True,
+                           timeout=timeout)
+        return r.returncode, r.stdout or "", r.stderr or ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return 127, "", str(e)
+
+
+def have_network(url):
+    # curl, not urllib: --max-time bounds the WHOLE fetch including
+    # DNS, which urllib's timeout does not (a dead DNS server can
+    # hang getaddrinfo for minutes). A network failure returns False
+    # and the caller prints a clear message instead of a traceback.
+    if os.environ.get("AEGIS_TOOLS_OFFLINE") == "1":
+        return False  # test hook: simulate no network
+    try:
+        r = subprocess.run(
+            ["curl", "-fsSI", "--max-time", "15",
+             "-H", "User-Agent: aegis-tools", url],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return r.returncode == 0
+
+
+def download(url, dest):
+    # curl with a hard wall-clock limit (covers DNS too).
+    try:
+        r = subprocess.run(
+            ["curl", "-fsSL", "--max-time", "600",
+             "-H", "User-Agent: aegis-tools",
+             "-o", dest, url],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=660)
+    except (OSError, subprocess.SubprocessError) as e:
+        die(f"download failed ({url}): {e}")
+    if r.returncode != 0:
+        die(f"download failed ({url}): curl exit {r.returncode}")
+
+
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 256), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def is_shell_script(path):
+    try:
+        with open(path, "rb") as f:
+            head = f.read(64)
+    except OSError:
+        return False
+    return head.startswith(b"#!/bin/sh") or head.startswith(b"#!/bin/bash")
+
+
+def dpkg_status(pkg):
+    """Return True if apt package `pkg` is installed, else False."""
+    rc, _, _ = run(["dpkg-query", "-W", "-f=${Status}", pkg])
+    return rc == 0
+
+
+def find_zap_install():
+    """Return the ZAP install dir if zap.sh is found, else None.
+
+    The IzPack installer picks its own default directory, so check
+    the usual locations (fixed paths first, then versioned home
+    directories such as ~/ZAP_2.17.0).
+    """
+    candidates = ["/opt/zaproxy", "/opt/ZAP", "/usr/local/zaproxy"]
+    for d in candidates:
+        if os.path.isfile(os.path.join(d, "zap.sh")):
+            return d
+    for pat in ("/root/ZAP_*/zap.sh", "/home/*/ZAP_*/zap.sh",
+                "/opt/ZAP_*/zap.sh"):
+        for match in sorted(glob.glob(pat)):
+            return os.path.dirname(match)
+    return None
+
+
+def debian_status(name):
+    pkg, _desc = DEBIAN_TOOLS[name]
+    if shutil.which(name):
+        return "installed"
+    if dpkg_status(pkg):
+        return "installed"
+    return "not installed"
+
+
+def cmd_list():
+    print("AegisOS security tools")
+    print()
+    print("Pre-installed (Debian packages):")
+    for name in DEBIAN_TOOLS:
+        pkg, desc = DEBIAN_TOOLS[name]
+        print(f"  {name:<12} {desc} [{debian_status(name)}]")
+    print()
+    print("On-demand (installed with: sudo aegis-tools install <name>):")
+    for name in ON_DEMAND:
+        info = ON_DEMAND[name]
+        if name == "zaproxy":
+            found = find_zap_install()
+            state = f"installed ({found})" if found else "not installed"
+        elif os.path.exists(info["marker"]):
+            state = f"installed ({info['install_dir']})"
+        else:
+            state = "not installed"
+        print(f"  {name:<12} {info['description']} [{state}]")
+    print()
+    print("Anything else in Debian's repos works with plain apt, e.g.:")
+    print("  sudo apt install <package>")
+    return 0
+
+
+def cmd_install(args):
+    if not args:
+        die("usage: aegis-tools install <name>\n"
+            "  (try: aegis-tools list)", code=2)
+    name = args[0]
+    if len(args) > 1:
+        die(f"unknown argument: {args[1]}", code=2)
+    if os.geteuid() != 0:
+        die("install needs root — run: sudo aegis-tools install "
+            f"{name}", code=2)
+
+    if name in DEBIAN_TOOLS:
+        pkg, _desc = DEBIAN_TOOLS[name]
+        if debian_status(name) == "installed":
+            print(f"{name} is already installed "
+                  f"(Debian package {pkg}).")
+            return 0
+        print(f"{name} is a Debian package and is not installed.")
+        print(f"Install it with: sudo apt install {pkg}")
+        return 0
+
+    if name not in ON_DEMAND:
+        valid = ", ".join(list(DEBIAN_TOOLS) + list(ON_DEMAND))
+        die(f"unknown tool: {name}\n"
+            f"  Valid names: {valid}", code=2)
+
+    info = ON_DEMAND[name]
+    if name == "zaproxy":
+        found = find_zap_install()
+        if found:
+            print(f"{name} is already installed ({found}).")
+            return 0
+    elif os.path.exists(info["marker"]):
+        print(f"{name} is already installed ({info['install_dir']}).")
+        return 0
+
+    url = info["url"]
+    expected_size = None
+    if name == "zaproxy":
+        # Resolve the current version + download URL + size from the
+        # GitHub latest-release API; fall back to the pinned URL if
+        # the API is unreachable (the version-less Burp URL needs no
+        # such lookup — it always serves the latest release).
+        url, expected_size = resolve_zap_release() or (url, None)
+
+    if not have_network(url):
+        die(f"cannot reach {url} — check the network and try again.")
+
+    if name == "zaproxy":
+        check_java()
+
+    tmp = os.path.join(tempfile.gettempdir(),
+                       f"aegis-tools-{name}-installer.sh")
+    print(f"Downloading {name} installer ...")
+    print(f"  {url}")
+    download(url, tmp)
+    size = os.path.getsize(tmp)
+    print(f"  downloaded {size // (1024 * 1024)} MiB "
+          f"({size} bytes)")
+    print(f"  sha256: {sha256_file(tmp)}")
+    if expected_size is not None and size != expected_size:
+        die(f"download size mismatch for {name}: got {size} bytes, "
+            f"expected {expected_size} — the download is corrupt; "
+            f"delete {tmp} and try again")
+    if not is_shell_script(tmp):
+        die(f"downloaded {name} installer is not a shell script — "
+            f"refusing to run it (check {tmp})")
+    os.chmod(tmp, 0o755)
+
+    if name == "burpsuite":
+        return install_burpsuite(tmp)
+    return install_zaproxy(tmp)
+
+
+def resolve_zap_release():
+    """Return (unix installer URL, size) for the latest ZAP release.
+
+    Returns None if the GitHub API cannot be reached or the asset
+    is missing — the caller then falls back to the pinned URL.
+    """
+    try:
+        r = subprocess.run(
+            ["curl", "-fsSL", "--max-time", "15",
+             "-H", "User-Agent: aegis-tools",
+             "-H", "Accept: application/vnd.github+json", ZAP_API],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    try:
+        data = json.loads(r.stdout)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    for asset in data.get("assets", []):
+        aname = asset.get("name", "")
+        if re.match(r"ZAP_\d+_\d+_\d+_unix\.sh$", aname):
+            url = asset.get("browser_download_url")
+            size = asset.get("size")
+            if url:
+                print(f"  latest ZAP release: {data.get('tag_name')} "
+                      f"({aname})")
+                return url, size
+    return None
+
+
+def check_java():
+    """ZAP needs Java 17+. Install default-jre via apt if missing."""
+    rc, out, _err = run(["java", "-version"])
+    if rc == 0:
+        m = re.search(r'"(\d+)(?:\.(\d+))?', out + _err)
+        major = int(m.group(1)) if m else 0
+        # java -version prints to stderr; out+err covers both.
+        if major >= 17:
+            print(f"  Java {major} found — ZAP needs 17+, OK.")
+            return
+        print(f"  Java {major} found — ZAP needs 17+, upgrading ...")
+    else:
+        print("  Java not found — ZAP needs Java 17+, installing "
+              "default-jre ...")
+    rc, out, err = run(["apt-get", "install", "-y", "default-jre"],
+                       timeout=600)
+    if rc != 0:
+        die("could not install Java (default-jre) via apt — "
+            "install Java 17+ first, then run this again.\n"
+            f"  apt output: {last_line(out + err)}")
+    print("  Java installed.")
+
+
+def install_burpsuite(installer):
+    # install4j unattended install; the install directory comes from
+    # a response varfile (sys.installationDir), per PortSwigger's
+    # unattended-install documentation. Default (no varfile) would
+    # be /opt too, but the varfile pins it explicitly.
+    varfile = os.path.join(tempfile.gettempdir(),
+                           "aegis-tools-burp-response.varfile")
+    with open(varfile, "w") as f:
+        f.write("sys.installationDir=/opt/BurpSuiteCommunity\n")
+    print("Installing Burp Suite Community to "
+          "/opt/BurpSuiteCommunity ...")
+    rc, out, err = run(["sh", installer, "-q", "-varfile", varfile],
+                       timeout=900)
+    if rc != 0:
+        die(f"Burp Suite installer failed (exit {rc}) — "
+            f"installer left at {installer}\n"
+            f"  {last_line(out + err)}")
+    marker = ON_DEMAND["burpsuite"]["marker"]
+    if not os.path.exists(marker):
+        die("Burp Suite installer finished but "
+            f"{marker} is missing — install may have failed; "
+            f"installer left at {installer}")
+    print("Done — Burp Suite Community is installed in "
+          "/opt/BurpSuiteCommunity.")
+    print("  Launch it with: /opt/BurpSuiteCommunity/BurpSuiteCommunity")
+    print("  (or find 'Burp Suite Community Edition' in the app "
+          "launcher)")
+    return 0
+
+
+def install_zaproxy(installer):
+    # IzPack unattended install (-q). The installer picks its own
+    # default directory, so the result is found by searching the
+    # usual locations afterwards.
+    print("Installing OWASP ZAP ...")
+    rc, out, err = run(["sh", installer, "-q"], timeout=900)
+    if rc != 0:
+        die(f"ZAP installer failed (exit {rc}) — "
+            f"installer left at {installer}\n"
+            f"  {last_line(out + err)}")
+    found = find_zap_install()
+    if not found:
+        die("ZAP installer finished but no zap.sh was found in the "
+            "usual locations (/opt/zaproxy, ~/ZAP_*) — install may "
+            f"have failed; installer left at {installer}")
+    print(f"Done — OWASP ZAP is installed in {found}.")
+    print(f"  Launch it with: {found}/zap.sh")
+    return 0
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("--help", "-h", "help"):
+        print(__doc__.strip())
+        return 0
+    if args[0] == "list":
+        if len(args) > 1:
+            die(f"unknown argument: {args[1]}", code=2)
+        sys.exit(cmd_list())
+    if args[0] == "install":
+        sys.exit(cmd_install(args[1:]))
+    valid = ", ".join(["list", "install", "help"])
+    die(f"unknown command: {args[0]} (try: {valid})", code=2)
+
+
+if __name__ == "__main__":
+    main()

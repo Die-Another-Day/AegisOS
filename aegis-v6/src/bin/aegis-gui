@@ -1,0 +1,163 @@
+#!/bin/bash
+# aegis-gui — start the AegisOS v6 graphical desktop ON DEMAND (Wayland).
+# Default boot is CLI + web console on http://127.0.0.1:8000 (unchanged).
+# This command does NOT change the default boot target.
+# v6 replaces the v5 sway stack with Hyprland 0.55.2 + Quickshell 0.3.0.
+# Usage: aegis-gui [--window|--fullscreen|--lock|--secure-lock|--lock-and-desktop|--restart-shell|--stop|--help]
+#  --window           start Hyprland + Quickshell shell (default)
+#  --fullscreen       start Hyprland and request the largest output mode
+#  --lock             show the Quickshell lock screen only (exits on unlock)
+#  --secure-lock      hyprlock (analyst password) — fallback lock
+#  --lock-and-desktop lock screen first, then the desktop shell (Hyprland autostart)
+#  --restart-shell    restart the Quickshell shell inside a running Hyprland session
+#  --stop             stop Hyprland + shell and return to the CLI
+#  --help             show this help
+set -u
+MODE="window"
+for a in "$@"; do
+  case "$a" in
+    --help|-h)
+      echo "aegis-gui — start the AegisOS v6 GUI on demand (Hyprland + Quickshell)"
+      echo "  aegis-gui                  start Hyprland + shell (default)"
+      echo "  aegis-gui --window         start Hyprland + shell"
+      echo "  aegis-gui --fullscreen     start Hyprland, largest output mode"
+      echo "  aegis-gui --lock           Quickshell lock screen only"
+      echo "  aegis-gui --secure-lock    hyprlock (analyst password)"
+      echo "  aegis-gui --lock-and-desktop  lock screen, then desktop (Hyprland autostart)"
+      echo "  aegis-gui --restart-shell  restart the Quickshell shell in a running session"
+      echo "  aegis-gui --stop           stop Hyprland + shell, back to CLI"
+      echo "Default boot stays CLI + web console at http://127.0.0.1:8000."
+      echo "GUI stack: Hyprland 0.55.2, Quickshell 0.3.0, hyprlock, swww, Google Chrome, firefox-esr."
+      echo "In the GUI, the Console launcher opens http://127.0.0.1:8000 in a browser."
+      exit 0 ;;
+    --window) MODE="window" ;;
+    --fullscreen) MODE="fullscreen" ;;
+    --lock) MODE="lock" ;;
+    --secure-lock) MODE="secure-lock" ;;
+    --lock-and-desktop) MODE="lock-and-desktop" ;;
+    --restart-shell) MODE="restart-shell" ;;
+    --stop)
+      echo "Stopping AegisOS GUI..."
+      pkill -u "$USER" -f "quickshell" 2>/dev/null || true
+      pkill -u "$USER" -x qs 2>/dev/null || true
+      pkill -u "$USER" Hyprland 2>/dev/null || true
+      pkill -u "$USER" hypridle 2>/dev/null || true
+      pkill -u "$USER" swww-daemon 2>/dev/null || true
+      echo "GUI stopped. You are back on the CLI. Web console still runs on http://127.0.0.1:8000."
+      exit 0 ;;
+    *) echo "Unknown option: $a (try aegis-gui --help)" >&2; exit 1 ;;
+  esac
+done
+
+# Preflight: Hyprland needs a real VT/seat — a serial console, SSH session
+# or WSL terminal window has no display for it, and Hyprland then dies
+# with seat/DRM errors. Fail fast with a clear message instead.
+# Skipped when already inside a Hyprland session (HYPRLAND_INSTANCE_SIGNATURE
+# / WAYLAND_DISPLAY set) and for non-GUI modes.
+check_gui_seat() {
+  if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ] || [ -n "${WAYLAND_DISPLAY:-}" ]; then
+    return 0
+  fi
+  local tty_name
+  tty_name=$(tty 2>/dev/null) || tty_name="not a tty"
+  case "$tty_name" in
+    /dev/tty[0-9]*)
+      return 0 ;;  # real virtual terminal: Hyprland can take the seat here
+    /dev/ttyS*|/dev/pts/*|"not a tty")
+      cat >&2 <<'EOF'
+aegis-gui: no graphical display here — Hyprland needs the VM's own display.
+This terminal is a serial console / remote terminal, which has no screen,
+so the GUI cannot start from it.
+To see the desktop instead:
+  * From WSL: stop QEMU and relaunch with -vnc :1, connect a VNC viewer
+    on Windows to localhost:5901, log in and run aegis-gui on the VM's screen.
+  * In VirtualBox: boot the image there and run aegis-gui from the VM's
+    own display (tty1).
+EOF
+      exit 1 ;;
+    *)
+      return 0 ;;
+  esac
+}
+
+case "$MODE" in
+  window|fullscreen|lock|secure-lock|lock-and-desktop|restart-shell) check_gui_seat ;;
+esac
+
+# Theme: regenerate the colour theme on first GUI start if it is missing.
+mkdir -p "$HOME/.config/aegis"
+if [ ! -f "$HOME/.config/aegis/theme.json" ] && [ -f "$HOME/.config/aegis/wallpaper.png" ]; then
+  aegis-colours "$HOME/.config/aegis/wallpaper.png" --out "$HOME/.config/aegis" 2>/dev/null || echo "aegis-gui: theme regeneration failed (shell will use built-in defaults)" >&2
+fi
+export XDG_RUNTIME_DIR="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}"
+mkdir -p "$XDG_RUNTIME_DIR" 2>/dev/null || true
+# Cursor: Hyprland-native software-cursor fallback (v5.0.3 lesson, carried
+# forward — the DRM hardware-cursor plane failed on QEMU virtio-vga and
+# VirtualBox VMSVGA, leaving the pointer invisible). Also set in
+# hyprland.conf; the env var is belt-and-braces for the renderer path.
+export WLR_NO_HARDWARE_CURSORS=1
+export MOZ_ENABLE_WAYLAND=1
+
+case "$MODE" in
+  lock)
+    command -v qs >/dev/null 2>&1 || { echo "ERROR: Quickshell (qs) is not installed in this image." >&2; exit 1; }
+    # A bare lock needs a compositor: if one is running, ask the shell
+    # to lock via IPC; else start Hyprland (autostart locks on entry).
+    if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+      exec qs -c aegis ipc call aegis lock
+    else
+      exec Hyprland
+    fi
+    ;;
+  secure-lock)
+    if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+      exec hyprlock
+    else
+      echo "aegis-gui --secure-lock must run inside a Hyprland session (start aegis-gui first)." >&2
+      exit 1
+    fi
+    ;;
+  lock-and-desktop)
+    # The shell starts locked and reveals the desktop after a PAM unlock.
+    # Inside a session, just (re-)lock; outside one, start Hyprland
+    # (autostart locks on entry).
+    if [ -n "${HYPRLAND_INSTANCE_SIGNATURE:-}" ]; then
+      exec qs -c aegis ipc call aegis lock
+    else
+      exec Hyprland
+    fi
+    ;;
+  restart-shell)
+    # check_gui_seat above already failed fast (exit 1) when there is
+    # no session to restart the shell in.
+    pkill -u "$USER" -x qs 2>/dev/null || true
+    sleep 1
+    qs -c aegis &
+    QS_PID=$!
+    for _ in $(seq 1 30); do
+      # `-c aegis` is required (see aegis-autostart): without it the IPC
+      # client looks for a "default" config and never reaches the shell.
+      qs -c aegis ipc call aegis lock >/dev/null 2>&1 && break
+      sleep 0.5
+    done
+    wait "$QS_PID"
+    ;;
+  window|fullscreen)
+    if pgrep -u "$USER" -x Hyprland >/dev/null 2>&1; then
+      echo "GUI is already running. Use aegis-gui --stop to stop it."
+      exit 0
+    fi
+    command -v Hyprland >/dev/null 2>&1 || { echo "ERROR: Hyprland is not installed in this image." >&2; exit 1; }
+    if [ "$MODE" = "fullscreen" ]; then
+      echo "Starting AegisOS GUI (Hyprland, fullscreen request: largest mode on session start)..."
+      mkdir -p "$HOME/.config/hypr"
+      printf 'monitor=,preferred,auto,1\n' > "$HOME/.config/hypr/fullscreen.conf"
+    else
+      rm -f "$HOME/.config/hypr/fullscreen.conf"
+      echo "Starting AegisOS GUI (Hyprland + Quickshell)..."
+    fi
+    echo "Tip: quit the GUI with Super+Shift+E, or run aegis-gui --stop from another console."
+    echo "Web console stays at http://127.0.0.1:8000."
+    exec Hyprland
+    ;;
+esac

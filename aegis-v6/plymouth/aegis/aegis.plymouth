@@ -1,0 +1,8 @@
+[Plymouth Theme]
+Name=Aegis
+Description=AegisOS boot splash — text-only "AegisOS" fading in and out over twinkling stars
+ModuleName=script
+
+[script]
+ImageDir=/usr/share/plymouth/themes/aegis
+ScriptFile=/usr/share/plymouth/themes/aegis/aegis.script

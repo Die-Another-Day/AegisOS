@@ -1,0 +1,18 @@
+[Unit]
+Description=AegisOS v5 lab vulnerable web app (LAB ONLY, private LAN only)
+After=network.target
+[Service]
+Type=simple
+User=labweb
+EnvironmentFile=-/etc/aegis-lab/env
+ExecStart=/usr/bin/python3 /srv/labapp/labapp.py $SECUREOS_BIND_IP
+Restart=on-failure
+StandardOutput=journal
+StandardError=journal
+# NO [Install] section — on purpose. This unit must NEVER start at boot:
+# systemd's first-boot preset population ("Populated /etc with preset unit
+# settings") enables every unit that has an [Install] section, which is
+# how v5 repack #3 started the lab at boot with lab state "disabled".
+# Without [Install] the unit is static: it can only be started explicitly
+# (aegis-lab --enable / aegis-ir recover use `systemctl restart`), never
+# by preset, enable, or first-boot population. See README-v5.md.

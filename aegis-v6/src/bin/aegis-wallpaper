@@ -1,0 +1,28 @@
+#!/bin/bash
+# aegis-wallpaper — switch wallpaper and re-derive the whole theme (v6).
+# Usage: aegis-wallpaper <wallpaper.png | v6 | starfield | sunset | animated>
+# Re-runs aegis-colours.py (dominant/accent -> theme.json), re-points
+# swww at the new wallpaper, and tells the shell (it re-reads theme.json).
+set -euo pipefail
+CFG="$HOME/.config/aegis"
+mkdir -p "$CFG"
+case "${1:-}" in
+  v6) SRC="/usr/share/aegis/wallpapers/aegis-v6.png" ;;
+  animated) SRC="/usr/share/aegis/wallpapers/aegis-v6-animated.gif" ;;
+  starfield) SRC="/usr/share/aegis/wallpapers/aegis-starfield.png" ;;
+  sunset)    SRC="/usr/share/aegis/wallpapers/aegis-sunset.png" ;;
+  ""|--help|-h)
+    echo "Usage: aegis-wallpaper <wallpaper.png | v6 | animated | starfield | sunset>"
+    echo "Wallpapers shipped: v6, animated, starfield, sunset (in /usr/share/aegis/wallpapers/)"
+    exit 0 ;;
+  *) SRC="$1" ;;
+esac
+[ -f "$SRC" ] || { echo "wallpaper not found: $SRC" >&2; exit 1; }
+cp "$SRC" "$CFG/wallpaper.png"
+python3 /usr/local/lib/aegis-colours.py "$CFG/wallpaper.png" --out "$CFG" 2>/dev/null || echo "note: theme recolour needs Pillow; shell will use built-in defaults"
+if command -v swww >/dev/null 2>&1 && swww query >/dev/null 2>&1; then
+  swww img "$CFG/wallpaper.png" --transition-type fade --transition-duration 1
+  echo "Wallpaper switched to $SRC (swww) — widgets recoloured from the new palette."
+else
+  echo "Wallpaper switched to $SRC — restart the GUI (aegis-gui --stop, then aegis-gui) to apply it."
+fi

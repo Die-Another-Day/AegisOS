@@ -1,0 +1,53 @@
+#!/bin/bash
+# aegis-autostart — run once by Hyprland on session start (exec-once in
+# hyprland.conf). Starts the wallpaper engine, the idle locker, then the
+# Quickshell shell — locked first (like v5), desktop after PAM unlock.
+set -u
+# Quickshell shell FIRST (bar + lock screen + launcher + right-click
+# menu). The shell starts UNLOCKED (locked: false in shell.qml), so
+# engage the lock via IPC once the shell's IpcHandler is up — the
+# session opens on the lock screen and the desktop appears only after
+# a PAM unlock.
+# NOTE (v6, 2026-11-22): qs runs BEFORE the wallpaper animation is
+# started on purpose. The bar is always visible (see shell.qml), so
+# its first frame is rendered at shell startup; starting the animated
+# GIF wallpaper first saturates the CPU under software rendering and
+# delays the shell's first frames by minutes (diag9/diag10). Starting
+# qs first gives the shell the CPU to render its first frames, and the
+# wallpaper animation begins once the shell is up and locked.
+qs -c aegis &
+QS_PID=$!
+for _ in $(seq 1 30); do
+  # NOTE (v6, 2026-11-22): `-c aegis` is REQUIRED — without it the IPC
+  # client looks for a "default" config and errors out, so the lock
+  # never engaged and this loop ground on for the full 30 tries.
+  qs -c aegis ipc call aegis lock >/dev/null 2>&1 && break
+  sleep 0.5
+done
+# Idle lock after 600 s (same timing as v5).
+hypridle >/dev/null 2>&1 &
+# Wallpaper: animated GIF via swww if present, else static via hyprpaper.
+# Started after the shell so the animation does not compete with the
+# shell's first frames (see the note above).
+if command -v swww >/dev/null 2>&1; then
+  swww-daemon >/dev/null 2>&1 &
+  sleep 1
+  # Animated GIF is the default when swww is present (it animates GIFs);
+  # fall back to the static wallpaper otherwise.
+  WP="/usr/share/aegis/wallpapers/aegis-v6-animated.gif"
+  [ -f "$WP" ] || WP="${HOME}/.config/aegis/wallpaper.png"
+  [ -f "$WP" ] || WP="/usr/share/aegis/wallpapers/aegis-v6.png"
+  # Set the wallpaper in the background, retrying until the daemon is
+  # ready. The daemon can take a while to start under QEMU (software
+  # rendering), and a single foreground `swww img` used to block this
+  # script for ~30-85 s waiting for it; a single backgrounded call can
+  # instead fail instantly if the daemon is not up yet and never retry,
+  # leaving a black desktop. The retry loop (backgrounded) fixes both.
+  ( for _ in $(seq 1 30); do
+      swww img "$WP" --transition-type fade --transition-duration 2 >/dev/null 2>&1 && break
+      sleep 2
+    done ) &
+elif command -v hyprpaper >/dev/null 2>&1; then
+  hyprpaper >/dev/null 2>&1 &
+fi
+wait "$QS_PID"
