@@ -1,19 +1,28 @@
 #!/usr/bin/env python3
-"""Bootstrap test for AegisOS v5.0.2.
+"""Bootstrap test for AegisOS v5.0.2 (extended 2026-11-23 for the
+updater v5->v6 hotfix).
 
 Boots a COPY of the shipped v5.0.0 image (which has no updater and no
 /etc/aegis-version) and runs bootstrap-update.sh against a local HTTP
-server on the host (guest: 10.0.2.2:18081), twice:
+server on the host (guest: 10.0.2.2:18081), four times:
 
   1. TAMPERED run: the served aegis-gui has one byte flipped. The
      bootstrap must abort with HASH MISMATCH, exit non-zero, and
      install NOTHING (/etc/aegis-version still absent, no aegis-update).
   2. GOOD run: the server file is swapped back to the genuine one.
      The bootstrap must succeed and install all four files with the
-     exact expected hashes, write /etc/aegis-version as 5.0.1, and
-     `aegis-update check` must run (reporting 5.0.1 + the graceful
+     exact expected hashes, write /etc/aegis-version as 5.0.3, and
+     `aegis-update check` must run (reporting 5.0.3 + the graceful
      no-network message — this VM's QEMU user-net has no external
      egress, proven in net-probe-v502).
+  3. INSTALL-FAILURE run (v5.0.3): a directory sits where
+     /usr/local/bin/aegis-update should be. The bootstrap must abort
+     with INSTALL FAILED naming the file, exit non-zero, write no
+     version file, and print no "done".
+  4. KEEP-5.0.3 run (hotfix trap test): /etc/aegis-version already
+     reads 5.0.3. The bootstrap must re-run cleanly, install the fixed
+     updater, and LEAVE the version file at 5.0.3 — the old script
+     wrote 5.0.1 unconditionally, which would have downgraded it.
 
 Usage: bootstrap-test-v502.py <v500-image> <logfile>
 """
@@ -40,7 +49,7 @@ EXPECTED = {
     "aegis-v5/wayland/aegis-shell.py": "a862c7aa67987f82f5dd94e38fd4fe9c0c53b0cda64a74c4033cdfe49ea60edb",
     "aegis-v5/bin/aegis-gui": "b92cc53595ef7cca9f26f9779b976dc15f82b20c34797ca2bd8ff154e62dbd98",  # v5.0.3 preflight guard + WLR_NO_HARDWARE_CURSORS cursor fix
     "aegis-v5/serial-shell-test-v501.py": "53e0703bdd1400d7a0e36ba805ee2a5ba71b1a3e13b42a50b7f3b806b5154a6b",
-    "aegis-v5/bin/aegis-update": "a17a47bb25504514557362e13e87aa802e9411f2e2af53cf3494e79796daea63",
+    "aegis-v5/bin/aegis-update": "65830fb31ed61db9005422b8220d61058a941cbb36efe307706c1e3a5edcb647",  # 2026-11-23 hotfix: major version from release tag (v5->v6 fetch)
 }
 
 if SERVE.exists():
@@ -151,10 +160,10 @@ if ok:
     send(f"echo MARK_BS_GOOD; curl -fsSL {HOST_URL}/aegis-v5/bootstrap-update.sh -o /tmp/bootstrap-update.sh && {SUDO} env AEGIS_RAW_BASE={HOST_URL} bash /tmp/bootstrap-update.sh; echo BS_GOOD_RC=$?; cat /etc/aegis-version; sha256sum /usr/local/lib/aegis-shell/aegis-shell.py /usr/local/bin/aegis-gui /usr/local/bin/aegis-update /usr/local/bin/serial-shell-test-v501.py; aegis-update check; echo CHECK_RC=$?\n")
     ok &= drain("good", timeout=240)
     check(rb"BS_GOOD_RC=0", "good run exit 0")
-    check(rb"5\.0\.1", "version file reads 5.0.1")
+    check(rb"5\.0\.3", "version file reads 5.0.3")
     for rel, h in EXPECTED.items():
         check(re.escape(h).encode(), f"installed hash matches for {rel}")
-    check(rb"Installed version: 5\.0\.1", "aegis-update check reports 5.0.1")
+    check(rb"Installed version: 5\.0\.3", "aegis-update check reports 5.0.3")
 if ok:
     # Run 3 (v5.0.3): install failure must NOT print "done".
     # Simulate a corrupted/unwritable destination: a directory sits
@@ -185,6 +194,36 @@ if ok:
         ok = False
     else:
         print("[bootstrap-test] PASS install-failure run printed no 'done'", flush=True)
+if ok:
+    # Run 4 (hotfix trap test): version file already 5.0.3 — the
+    # bootstrap must NOT downgrade it. Remove the directory run 3 left
+    # where aegis-update should be (rm -rf, not rmdir: run 3's cp
+    # copied a file INTO it, so rmdir fails "Directory not empty"),
+    # seed 5.0.3, re-run the good bootstrap, and check the version is
+    # still 5.0.3 afterwards.
+    seg_start = len(buf)
+    send(f"echo MARK_BS_KEEP503; {SUDO} rm -rf /usr/local/bin/aegis-update; {SUDO} sh -c \"printf '5.0.3\\n' > /etc/aegis-version\"; curl -fsSL {HOST_URL}/aegis-v5/bootstrap-update.sh -o /tmp/bootstrap-update.sh && {SUDO} env AEGIS_RAW_BASE={HOST_URL} bash /tmp/bootstrap-update.sh; echo BS_KEEP503_RC=$?; cat /etc/aegis-version; sha256sum /usr/local/bin/aegis-update\n")
+    ok &= drain("keep503", timeout=240)
+    seg = buf[seg_start:]
+    def check_seg4(pat, label):
+        global ok
+        found = re.search(pat, seg)
+        print(f"[bootstrap-test] {'PASS' if found else 'FAIL'} {label}: {pat}", flush=True)
+        ok = ok and bool(found)
+        return bool(found)
+    check_seg4(rb"BS_KEEP503_RC=0", "keep-5.0.3 run exit 0")
+    check_seg4(rb"version file 5\.0\.3.*left as is", "bootstrap reports version left as is")
+    # Match the sha256sum output line, not just the hash string: the
+    # hash also appears inside an INSTALL FAILED error message, so a
+    # bare hash match would pass vacuously on a failed run.
+    check_seg4(re.escape(EXPECTED["aegis-v5/bin/aegis-update"]).encode()
+               + rb"  /usr/local/bin/aegis-update",
+               "fixed updater installed after re-run")
+    if re.search(rb"5\.0\.1", seg):
+        print("[bootstrap-test] FAIL keep-5.0.3 run shows 5.0.1 (downgraded)", flush=True)
+        ok = False
+    else:
+        print("[bootstrap-test] PASS keep-5.0.3 run shows no 5.0.1", flush=True)
 if ok:
     send("echo MARK_BS_DONE; echo secure | sudo -S poweroff\n")
     drain("done")

@@ -1,13 +1,23 @@
 #!/bin/bash
 # bootstrap-update.sh — bring a running AegisOS v5.0.0 / v5.0.1 system up
 # to v5.0.1 AND install the aegis-update command, without re-downloading
-# the whole 5 GB image.
+# the whole 5 GB image. It also delivers the updater hotfix that lets a
+# v5 system fetch a v6 full image (see the version-file note below).
 #
 # Those images shipped before the updater existed, so this script fetches
 # the four changed/new files straight from GitHub main, verifies every
 # file's SHA256 against the hashes baked into this script, and only then
 # installs them. ANY hash mismatch aborts everything — nothing is
 # installed and nothing is half-updated.
+#
+# Version file: NEVER downgrade. The old script wrote 5.0.1
+# unconditionally, which would roll a 5.0.3 system back to 5.0.1 (found
+# 2026-11-23) — and a 5.0.1 version file would then make `aegis-update
+# check` offer the v5.0.2/v5.0.3 update again. The script now writes
+# 5.0.3 only when the file is missing or older (5.0 / 5.0.1 / 5.0.2),
+# and leaves 5.0.3 (or anything newer) exactly as it is. There is no
+# 5.0.4 release or image; VERSION stays 5.0.3 — this is a hotfix
+# delivered by bootstrap, not a new version.
 #
 # Usage (inside the running VM, as analyst):
 #   curl -fsSL https://raw.githubusercontent.com/Die-Another-Day/AegisOS/main/aegis-v5/bootstrap-update.sh -o /tmp/bootstrap-update.sh
@@ -31,13 +41,14 @@ fi
 # hashes if any of these files changes. NOTE: the aegis-gui hash below is
 # the v5.0.3 file (preflight guard from v5.0.2 + WLR_NO_HARDWARE_CURSORS
 # cursor fix), so a bootstrapped system also gets the serial-console
-# preflight and the visible cursor; the version file still reads 5.0.1,
-# so `aegis-update` may later offer the v5.0.2/v5.0.3 update again —
-# re-applying identical files, harmless.)
+# preflight and the visible cursor; the aegis-update hash is the
+# 2026-11-23 hotfix (derives the image major version from the release
+# tag, so a v5 system can fetch a v6 full image). The version file is
+# handled separately below and never downgraded.)
 FILES="aegis-v5/wayland/aegis-shell.py|/usr/local/bin/aegis-shell|a862c7aa67987f82f5dd94e38fd4fe9c0c53b0cda64a74c4033cdfe49ea60edb
 aegis-v5/bin/aegis-gui|/usr/local/bin/aegis-gui|b92cc53595ef7cca9f26f9779b976dc15f82b20c34797ca2bd8ff154e62dbd98
 aegis-v5/serial-shell-test-v501.py|/usr/local/bin/serial-shell-test-v501.py|53e0703bdd1400d7a0e36ba805ee2a5ba71b1a3e13b42a50b7f3b806b5154a6b
-aegis-v5/bin/aegis-update|/usr/local/bin/aegis-update|a17a47bb25504514557362e13e87aa802e9411f2e2af53cf3494e79796daea63"
+aegis-v5/bin/aegis-update|/usr/local/bin/aegis-update|65830fb31ed61db9005422b8220d61058a941cbb36efe307706c1e3a5edcb647"
 
 echo "bootstrap-update: downloading 4 files from $BASE ..."
 while IFS='|' read -r src dest hash; do
@@ -98,7 +109,16 @@ if [ "$install_failed" != "0" ]; then
   exit 1
 fi
 
-printf '5.0.1\n' > /etc/aegis-version
-chmod 644 /etc/aegis-version
-echo "bootstrap-update: done — system is now 5.0.1 with aegis-update installed."
+# Version file: write 5.0.3 only when missing or older — never downgrade.
+current=""
+[ -f /etc/aegis-version ] && current="$(tr -d '[:space:]' < /etc/aegis-version 2>/dev/null)"
+case "$current" in
+  ""|"5.0"|"5.0.1"|"5.0.2")
+    printf '5.0.3\n' > /etc/aegis-version
+    chmod 644 /etc/aegis-version
+    echo "bootstrap-update: version file ${current:-missing} -> 5.0.3." ;;
+  *)
+    echo "bootstrap-update: version file $current — left as is." ;;
+esac
+echo "bootstrap-update: done — updater hotfix installed (version $(cat /etc/aegis-version))."
 echo "Run: aegis-update check"

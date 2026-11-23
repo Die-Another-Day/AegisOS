@@ -342,8 +342,10 @@ sudo aegis-update apply     # patch bundle if the release carries one, else full
   `/etc/aegis-version`. Any hash mismatch or disallowed hook refuses the
   whole bundle and nothing is applied.
 - **Full-image fallback**: if a release has no patch bundle, the updater
-  downloads all `aegis-v5.img.xz.part-*` + `SHA256SUMS.txt` into
-  `/var/lib/aegis/update/<tag>/`, verifies every checksum, reassembles
+  downloads all `aegis-v<major>.img.xz.part-*` + `SHA256SUMS.txt` into
+  `/var/lib/aegis/update/<tag>/` (the major version comes from the release
+  tag, so a v5 system fetches `aegis-v6.img.xz.part-*` for a v6 release),
+  verifies every checksum, reassembles
   and integrity-checks the `.xz` — then **stops**. It never overwrites
   the disk the running system booted from; the printed instructions say
   how to flash the new image to USB or attach it as a new VM disk.
@@ -359,8 +361,36 @@ sudo aegis-update apply     # patch bundle if the release carries one, else full
   It downloads the v5.0.1 fix files (`aegis-shell`, `aegis-gui`, the
   serial test) plus `aegis-update` from GitHub main, verifies every
   SHA256 against hashes baked into the script, installs them, and writes
-  `/etc/aegis-version` as `5.0.1`. Any hash mismatch aborts with nothing
-  installed. After that, `aegis-update check` works normally.
+  `/etc/aegis-version` as `5.0.3` when it is missing or older — never a
+  downgrade (a 5.0.3 system keeps 5.0.3). Any hash mismatch aborts with
+  nothing installed. After that, `aegis-update check` works normally.
+
+## Updating to v6.0.0 from a v5 system (v5→v6 jump — updater hotfix)
+
+`aegis-update apply` on a v5.0.3 system used to fail against the v6.0.0
+release with "release v6.0.0 has no patch bundle and no complete image
+parts". Cause: the v5 updater hardcoded the full-image asset pattern
+`aegis-v5.img.xz.part-*`, but the v6.0.0 release's parts are named
+`aegis-v6.img.xz.part-*` — the match was always empty. The fix
+(delivered by `bootstrap-update.sh`, no new image): the updater derives
+the major version from the release tag, so it fetches
+`aegis-v6.img.xz.part-*` for a v6 release and `aegis-v5.img.xz.part-*`
+for a v5 one, and `check` reports the real download size from the
+release's part sizes instead of the hardcoded ~400 MB (v6's .xz is
+~778 MB).
+
+Even fixed, the updater only **downloads** the v6 image — v5→v6 is a full
+rebase (Debian 12 → 13, Sway → Hyprland + Quickshell), not an in-place
+upgrade. `apply` verifies every part, reassembles the image into
+`/var/lib/aegis/update/v6.0.0/`, prints STOP, and never touches the
+booted disk. Flash the downloaded image to a fresh USB or a new VM disk
+and boot that; the v5 system stays exactly as it is.
+
+To get the fix on a v5.0.3 system, re-run the bootstrap one-liner
+(above). It installs the fixed updater and leaves `/etc/aegis-version`
+at 5.0.3 — the old bootstrap wrote 5.0.1 unconditionally, which would
+have downgraded it. There is no 5.0.4 release or image; `VERSION`
+stays 5.0.3.
 
 ## What is NOT proven
 
