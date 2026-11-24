@@ -320,35 +320,35 @@ sudo aegis-fim --init | --check
 Full headless regression (lab enable → SQLi/SSH/plugin flags → alerts →
 IR → reset → stop): `python3 guest-test-v5.py aegis-v5.img logs/guest-test-v5.log`
 
-## Updating (v5.0.2 — no more full re-downloads for small fixes)
+## Updating (v5.0.2 — full-image updates, streamed)
 
-Every release before v5.0.2 shipped as a 5 GB image, so even a 3-file
-fix meant downloading all of it again. From v5.0.2 the system updates
-itself in place:
+The system fetches the latest full image and stages it. A new image is
+never applied to the running system in place — the staged image is
+flashed to USB or attached as a new VM disk:
 
 ```bash
 aegis-update check          # installed version (from /etc/aegis-version) vs latest GitHub release
-sudo aegis-update apply     # patch bundle if the release carries one, else full image
+sudo aegis-update apply     # fetches the full image (streamed) and stops
 ```
 
-- **Patch bundle** (`<tag>-patch.tar.gz` on the release): a tar.gz with
-  `manifest.json` (release tag, files with target paths + SHA256 each,
-  optional `post_apply` commands) and the changed files only. The
-  updater verifies every file's SHA256 *before* applying anything,
-  backs up every replaced file to `/var/lib/aegis/backup/<old-version>/`,
-  applies, runs the post-apply hooks (allowlisted: `systemctl
-  restart/reload` of an `aegis-*.service` unit, or
-  `aegis-lab-reset-flags`), then writes the new version to
-  `/etc/aegis-version`. Any hash mismatch or disallowed hook refuses the
-  whole bundle and nothing is applied.
-- **Full-image fallback**: if a release has no patch bundle, the updater
-  downloads all `aegis-v<major>.img.xz.part-*` + `SHA256SUMS.txt` into
+- **Full image, streamed**: the updater downloads the release's
+  `aegis-v<major>.img.xz.part-*` + `SHA256SUMS.txt` into
   `/var/lib/aegis/update/<tag>/` (the major version comes from the release
-  tag, so a v5 system fetches `aegis-v6.img.xz.part-*` for a v6 release),
-  verifies every checksum, reassembles
-  and integrity-checks the `.xz` — then **stops**. It never overwrites
-  the disk the running system booted from; the printed instructions say
-  how to flash the new image to USB or attach it as a new VM disk.
+  tag, so a v5 system fetches `aegis-v6.img.xz.part-*` for a v6 release).
+  Each part is SHA256-verified, appended to the final `.xz`, and deleted
+  — there is no separate combine step and parts never coexist with the
+  finished file, so the download needs only the final file + one part
+  on disk (~900 MB for v6, not ~1656 MB as the old two-phase download
+  needed). If the staged `.xz` already exists and verifies, `apply`
+  skips the download and just prints STOP again; a partial or corrupt
+  staged file is deleted and re-downloaded. Then it **stops**. It never
+  overwrites the disk the running system booted from; the printed
+  instructions say how to flash the new image to USB or attach it as
+  a new VM disk.
+- **Patch bundles are gone** (removed 2026-11-24): the old
+  `<tag>-patch.tar.gz` mechanism was never used — no patch bundle was
+  ever published for any release and no bundle builder was ever built.
+  If a builder is ever built, the mechanism can be re-added.
 - `check` works as any user and handles no-network with a clear
   message; `apply` needs root (`sudo`). No new packages: curl, python3,
   tar, sha256sum, coreutils only.
@@ -381,9 +381,9 @@ release's part sizes instead of the hardcoded ~400 MB (v6's .xz is
 
 Even fixed, the updater only **downloads** the v6 image — v5→v6 is a full
 rebase (Debian 12 → 13, Sway → Hyprland + Quickshell), not an in-place
-upgrade. `apply` verifies every part, reassembles the image into
-`/var/lib/aegis/update/v6.0.0/`, prints STOP, and never touches the
-booted disk. Flash the downloaded image to a fresh USB or a new VM disk
+upgrade. `apply` streams the image into
+`/var/lib/aegis/update/v6.0.0/` (each part verified, appended, deleted),
+prints STOP, and never touches the booted disk. Flash the downloaded image to a fresh USB or a new VM disk
 and boot that; the v5 system stays exactly as it is.
 
 To get the fix on a v5.0.3 system, re-run the bootstrap one-liner
@@ -543,8 +543,8 @@ stays 5.0.3.
 v5.0.0/v5.0.1 systems), `run-qemu.sh`, `run-qemu-gui.sh`, `guest-test-v5.py`,
 `guest-setup-v5.py`, `host-ssh-flag.py`, `vt-gui-test-v5.py`,
 `serial-shell-test-v501.py` (serial-console no-display test),
-`update-test-v502.py` (updater test: check, patch apply, tampered-bundle
-refusal, full-image fallback)
+`update-test-v502.py` (updater test: check, non-root refusal, streaming
+full-image apply, tampered-part refusal, resume)
 (graphical verification driver — boots a copy, logs in on tty1,
 gates every shot on live process/window state),
 `gui-test-v5.py` (SUPERSEDED by the vt driver — its serial-console

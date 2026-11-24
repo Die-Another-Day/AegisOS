@@ -40,9 +40,20 @@ SERVE = Path("/tmp/aegis-bootstrap-test-serve")
 PORT = 18081
 HOST_URL = f"http://10.0.2.2:{PORT}"
 
-# Recomputed 2026-11-22 after the -c aegis IPC fix (aegis-gui) and the
-# v5-regex fix (aegis-update); keep in sync with bootstrap-update.sh.
+# Recomputed 2026-11-24 after the streaming rewrite (aegis-update);
+# keep in sync with bootstrap-update.sh.
 EXPECTED = {
+    "aegis-v6/src/bin/aegis-gui": "943532f09479b61dbeed0b4272beecf6312d0757cb421141c795b16496f247a6",
+    "aegis-v6/bin/aegis-tools": "7c3930e8fcfd8bac9cbdf3e5c64ebccbc1b21f6fd79eb182ce16df3d6470a22c",
+    "aegis-v6/src/bin/aegis-update": "28c906e70365465ef2d5578125036e34147eca23a7d9b8b8e03b7c97797435c5",
+}
+
+# The v6.0.0 image ships the OLD updater (222cf879...); only the
+# bootstrap installs the new one. So the tampered run (which installs
+# nothing) must leave the OLD updater hash in place, while aegis-gui
+# and aegis-tools are unchanged files whose shipped hash already
+# equals EXPECTED.
+SHIPPED = {
     "aegis-v6/src/bin/aegis-gui": "943532f09479b61dbeed0b4272beecf6312d0757cb421141c795b16496f247a6",
     "aegis-v6/bin/aegis-tools": "7c3930e8fcfd8bac9cbdf3e5c64ebccbc1b21f6fd79eb182ce16df3d6470a22c",
     "aegis-v6/src/bin/aegis-update": "222cf879c5c6204e4b41ed2f9688122adb899173b4c07e394c4410a1d31fbefb",
@@ -150,7 +161,7 @@ if ok:
     ok &= drain("tamper", timeout=240)
     check(rb"HASH MISMATCH", "tampered run aborts on hash mismatch")
     check(rb"BS_TAMPER_RC=1", "tampered run exit non-zero")
-    for rel, h in EXPECTED.items():
+    for rel, h in SHIPPED.items():
         check(re.escape(h).encode(), f"tampered run left genuine hash for {rel}")
 if ok:
     # Swap the genuine file back in on the host, then run 2 (good).

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Updater v5->v6 jump test (hotfix 2026-11-23).
+"""Updater v5->v6 jump test (hotfix 2026-11-23, streaming rewrite 2026-11-24).
 
 Boots a COPY of the shipped v5.0.3 image in QEMU (serial console, no
 display) and proves the fixed updater can fetch a v6 full image. Serves
@@ -15,17 +15,29 @@ all fixtures from a local HTTP server on the host (guest reaches it at
      failure the user saw on his VM.
   2. Bootstrap (AEGIS_RAW_BASE -> local server, same one-liner the
      user runs): installs the fixed updater, leaves /etc/aegis-version
-     at 5.0.3, installed hash is the new one (65830fb3...).
+     at 5.0.3, installed hash is the new one (28c906e7...).
   3. `check` against the fake v6.0.0 release with the FIXED updater:
      reports v6.0.0 available with the REAL summed size (~3 MB for the
      fake parts — the size comes from the release's asset sizes, not a
      hardcoded number).
-  4. `apply` against the fake v6.0.0 release: downloads the v6 parts,
-     verifies every checksum, reassembles aegis-v6.img.xz with the hash
-     matching the release notes, prints STOP, exit 0, version file
-     still 5.0.3 (the fallback never touches the booted disk).
+  4. `apply` against the fake v6.0.0 release: STREAMS the v6 parts
+     (download, verify, append, delete — no combine step), produces a
+     byte-identical aegis-v6.img.xz (hash matching the release notes),
+     leaves no part files behind, prints STOP, exit 0, version file
+     still 5.0.3 (the fallback never touches the booted disk). Peak
+     disk during the run is sampled and must stay under
+     total + largest part + 1 MiB.
+  4b. RESUME (valid): `apply` again with the staged image present
+     skips the download entirely, prints "already staged" + STOP,
+     exit 0.
+  4c. RESUME (corrupt): the staged image is corrupted in place;
+     `apply` deletes it and re-downloads, hash matches again, STOP.
   5. REGRESSION: the fake API is swapped to a v5.0.5 release (v5 parts);
      the same updater must still check + apply it (aegis-v5.img.xz).
+  6. TAMPERED PART: the fake API is swapped to a v6.0.1 release whose
+     part-01 bytes are flipped (SHA256SUMS.txt keeps the good hashes);
+     `apply` must die with a checksum mismatch, exit 1, and leave no
+     partial .xz and no part files behind.
 
 Real-GitHub-API testing is impossible from this sandbox (no external
 egress, proven in net-probe-v502); the real proof will be the user
@@ -55,7 +67,7 @@ PORT = 18082
 HOST_URL = f"http://10.0.2.2:{PORT}"
 
 OLD_UPDATER_HASH = "a17a47bb25504514557362e13e87aa802e9411f2e2af53cf3494e79796daea63"
-NEW_UPDATER_HASH = "65830fb31ed61db9005422b8220d61058a941cbb36efe307706c1e3a5edcb647"
+NEW_UPDATER_HASH = "28c906e70365465ef2d5578125036e34147eca23a7d9b8b8e03b7c97797435c5"
 
 # --- Build test fixtures on the host --------------------------------------
 if SERVE.exists():
@@ -72,31 +84,43 @@ for rel in ("aegis-v5/bootstrap-update.sh", "aegis-v5/wayland/aegis-shell.py",
     shutil.copyfile(src, dst)
 
 
-def make_fake_image(prefix, data_bytes, tag):
+def make_fake_image(prefix, data_bytes, tag, outdir=None, tamper=None):
     """Build a fake full image: random data -> xz -> 2 parts + sums.
-    Returns (release dict, total part bytes)."""
-    raw = SERVE / f"fake-{prefix}.img"
+    Returns (release dict, total part bytes, largest part bytes,
+    SHA256SUMS text, .xz SHA256). When tamper is a part index, the
+    SERVED bytes of that part are flipped but SHA256SUMS.txt keeps the
+    good hashes, so the updater must refuse it on checksum mismatch.
+    Fixtures for different tags share part filenames, so a tampered
+    fixture is built into its own outdir and only copied into SERVE
+    when its release is activated (see swap_release)."""
+    outdir = outdir or SERVE
+    outdir.mkdir(parents=True, exist_ok=True)
+    raw = outdir / f"fake-{prefix}.img"
     raw.write_bytes(data_bytes)
     subprocess.run(["xz", "-k", "-f", str(raw)], check=True)
-    xz = SERVE / f"fake-{prefix}.img.xz"
+    xz = outdir / f"fake-{prefix}.img.xz"
     xz_hash = hashlib.sha256(xz.read_bytes()).hexdigest()
     data = xz.read_bytes()
     half = len(data) // 2
+    chunks = (data[:half], data[half:])
     names = []
-    for i, chunk in enumerate((data[:half], data[half:])):
+    for i, chunk in enumerate(chunks):
         name = f"aegis-{prefix}.img.xz.part-{i:02d}"
-        (SERVE / name).write_bytes(chunk)
+        served = bytearray(chunk)
+        if tamper == i:
+            served[0] ^= 0xFF
+        (outdir / name).write_bytes(bytes(served))
         names.append(name)
     sums = ""
-    for name in names:
-        sums += f"{hashlib.sha256((SERVE / name).read_bytes()).hexdigest()}  {name}\n"
-    (SERVE / f"SHA256SUMS-{prefix}.txt").write_text(sums)
+    for name, chunk in zip(names, chunks):
+        sums += f"{hashlib.sha256(chunk).hexdigest()}  {name}\n"
+    (outdir / f"SHA256SUMS-{prefix}.txt").write_text(sums)
     # The updater downloads SHA256SUMS.txt by that exact name; serve one
     # copy per release under distinct names and copy the right one in
     # place when the fake API is swapped (see swap_release below).
     assets = []
     for name in names:
-        assets.append({"name": name, "size": (SERVE / name).stat().st_size,
+        assets.append({"name": name, "size": (outdir / name).stat().st_size,
                        "browser_download_url": f"{HOST_URL}/{name}"})
     assets.append({"name": "SHA256SUMS.txt", "size": len(sums),
                    "browser_download_url": f"{HOST_URL}/SHA256SUMS.txt"})
@@ -106,23 +130,36 @@ def make_fake_image(prefix, data_bytes, tag):
                  f"Compressed .xz SHA256: {xz_hash}\n"),
         "assets": assets,
     }
-    return release, sum((SERVE / n).stat().st_size for n in names), sums
+    total = sum(len(c) for c in chunks)
+    largest = max(len(c) for c in chunks)
+    return release, total, largest, sums, xz_hash
 
 
 # v6 fake: 3 MiB of incompressible data -> ~3 MiB .xz, so `check` must
 # report "~3 MB download". v5 fake: 2 MiB -> "~2 MB".
-v6_release, v6_total, v6_sums = make_fake_image("v6", os.urandom(3 * 1024 * 1024), "v6.0.0")
-v5_release, v5_total, v5_sums = make_fake_image("v5", os.urandom(2 * 1024 * 1024), "v5.0.5")
+v6_release, v6_total, v6_largest, v6_sums, v6_xz_hash = make_fake_image(
+    "v6", os.urandom(3 * 1024 * 1024), "v6.0.0")
+v5_release, v5_total, v5_largest, v5_sums, v5_xz_hash = make_fake_image(
+    "v5", os.urandom(2 * 1024 * 1024), "v5.0.5")
+# Tampered v6.0.1: part-01 served corrupted, sums keep the good hashes.
+t_dir = SERVE / "tampered-v6.0.1"
+t_release, t_total, t_largest, t_sums, t_xz_hash = make_fake_image(
+    "v6", os.urandom(2 * 1024 * 1024), "v6.0.1", outdir=t_dir, tamper=1)
 V6_MB = v6_total // (1024 * 1024)
 V5_MB = v5_total // (1024 * 1024)
+V6_PEAK_BOUND = v6_total + v6_largest + 1024 * 1024
 print(f"[v6jump-test] fake v6 total {v6_total} bytes (~{V6_MB} MB); "
-      f"fake v5 total {v5_total} bytes (~{V5_MB} MB)", flush=True)
+      f"fake v5 total {v5_total} bytes (~{V5_MB} MB); "
+      f"v6 peak bound {V6_PEAK_BOUND} bytes", flush=True)
 
 api_dir = SERVE / "repos" / "Die-Another-Day" / "AegisOS" / "releases"
 api_dir.mkdir(parents=True)
 
 
-def swap_release(release, sums):
+def swap_release(release, sums, part_dir=None):
+    if part_dir is not None:
+        for p in Path(part_dir).glob("aegis-*.img.xz.part-*"):
+            shutil.copyfile(p, SERVE / p.name)
     (api_dir / "latest").write_text(json.dumps(release))
     (SERVE / "SHA256SUMS.txt").write_text(sums)
 
@@ -223,6 +260,14 @@ def check(pat, label):
     return bool(found)
 
 
+def check_absent(pat, label):
+    global ok
+    found = re.search(pat, buf[seg_start[0]:])
+    print(f"[v6jump-test] {'PASS' if not found else 'FAIL'} {label} (absent): {pat}", flush=True)
+    ok = ok and not found
+    return not found
+
+
 ok = True
 SUDO = "echo secure | sudo -S"
 ok &= wait_for(rb"aegis login:", 600, "login prompt")
@@ -265,17 +310,55 @@ if ok:
     check(f"Update available: v6\\.0\\.0 \\(full image only, ~{V6_MB} MB download\\)".encode(),
           f"fixed check reports real size ~{V6_MB} MB")
 if ok:
-    # 4. Fixed updater: apply fetches the v6 image.
+    # 4. Fixed updater: apply streams the v6 image. A background du
+    # sampler records peak disk use of the update dir during the run.
+    send("echo MARK_VJ_DU_START; rm -f /tmp/du.log /tmp/du.pid; echo secure | sudo -S sh -c 'echo $$ > /tmp/du.pid; while true; do du -sb /var/lib/aegis/update 2>/dev/null | cut -f1 >> /tmp/du.log; sleep 0.05; done' >/dev/null 2>&1 & echo DU_STARTED\n")
+    ok &= drain("du-start")
     mark()
-    send(f"echo MARK_VJ_APPLY6; {SUDO} env AEGIS_API_BASE={HOST_URL} aegis-update apply; echo APPLY6_RC=$?; cat /etc/aegis-version; {SUDO} ls -l /var/lib/aegis/update/v6.0.0/\n")
+    send(f"echo MARK_VJ_APPLY6; {SUDO} env AEGIS_API_BASE={HOST_URL} aegis-update apply; echo APPLY6_RC=$?; cat /etc/aegis-version\n")
     ok &= drain("apply6", timeout=240)
     check(rb"aegis-v6\.img\.xz\.part-00: OK", "v6 part-00 checksum OK")
     check(rb"aegis-v6\.img\.xz\.part-01: OK", "v6 part-01 checksum OK")
-    check(rb"matches the release notes", "v6 reassembled hash matches release notes")
+    check(rb"matches the release notes", "v6 assembled hash matches release notes")
     check(rb"STOP", "v6 apply prints STOP, does not install")
     check(rb"APPLY6_RC=0", "v6 apply exit 0")
-    check(rb"-rw-r--r--.*aegis-v6\.img\.xz", "joined file aegis-v6.img.xz listed in update dir")
     check(rb"5\.0\.3", "version file still 5.0.3 after v6 apply")
+if ok:
+    mark()
+    send(f"echo MARK_VJ_DU_STOP; kill $(cat /tmp/du.pid) 2>/dev/null; sleep 0.5; wc -l /tmp/du.log; PEAK=$(sort -n /tmp/du.log 2>/dev/null | tail -1); [ -n \"$PEAK\" ] || PEAK=0; echo PEAK=$PEAK BOUND={V6_PEAK_BOUND}; [ \"$PEAK\" -le {V6_PEAK_BOUND} ] && echo PEAK_OK || echo PEAK_TOO_HIGH\n")
+    ok &= drain("du-stop")
+    check(rb"PEAK_OK", "peak disk during streaming apply under total + largest part + 1 MiB")
+if ok:
+    # The staged .xz must be byte-identical to the fixture and no part
+    # files may be left behind (they are deleted as they are appended).
+    mark()
+    send(f"echo MARK_VJ_LS6; {SUDO} ls -l /var/lib/aegis/update/v6.0.0/; {SUDO} sha256sum /var/lib/aegis/update/v6.0.0/aegis-v6.img.xz\n")
+    ok &= drain("ls6")
+    check(rb"-rw-r--r--.*aegis-v6\.img\.xz", "joined file aegis-v6.img.xz listed in update dir")
+    check(re.escape(v6_xz_hash).encode(), "staged .xz byte-identical (sha256 matches fixture)")
+    check_absent(rb"part-", "no part files left in update dir after streaming apply")
+if ok:
+    # 4b. RESUME (valid): apply again with the staged image present.
+    mark()
+    send(f"echo MARK_VJ_RESUME; {SUDO} env AEGIS_API_BASE={HOST_URL} aegis-update apply; echo RESUME_RC=$?\n")
+    ok &= drain("resume", timeout=240)
+    check(rb"already staged", "resume prints already-staged")
+    check(rb"STOP", "resume prints STOP")
+    check(rb"RESUME_RC=0", "resume apply exit 0")
+    check_absent(rb"downloading", "resume downloads nothing")
+if ok:
+    # 4c. RESUME (corrupt): corrupt the staged image in place; apply
+    # must delete it and re-download (size is unchanged, so only the
+    # release-notes hash check can catch this).
+    mark()
+    send(f"echo MARK_VJ_CORRUPT; {SUDO} dd if=/dev/zero of=/var/lib/aegis/update/v6.0.0/aegis-v6.img.xz bs=32 count=1 seek=3 conv=notrunc; {SUDO} env AEGIS_API_BASE={HOST_URL} aegis-update apply; echo CORRUPT_RC=$?\n")
+    ok &= drain("corrupt", timeout=240)
+    check(rb"incomplete or corrupt", "corrupt staged image detected")
+    check(rb"downloading", "corrupt staged image triggers re-download")
+    check(rb"aegis-v6\.img\.xz\.part-00: OK", "re-download part-00 checksum OK")
+    check(rb"matches the release notes", "re-downloaded hash matches release notes")
+    check(rb"STOP", "corrupt-resume prints STOP")
+    check(rb"CORRUPT_RC=0", "corrupt-resume apply exit 0")
 if ok:
     # 5. Regression: swap the fake API to a v5.0.5 release (v5 parts).
     swap_release(v5_release, v5_sums)
@@ -292,10 +375,24 @@ if ok:
     ok &= drain("apply5", timeout=240)
     check(rb"aegis-v5\.img\.xz\.part-00: OK", "v5 part-00 checksum OK")
     check(rb"aegis-v5\.img\.xz\.part-01: OK", "v5 part-01 checksum OK")
-    check(rb"matches the release notes", "v5 reassembled hash matches release notes")
+    check(rb"matches the release notes", "v5 assembled hash matches release notes")
     check(rb"STOP", "v5 apply prints STOP, does not install")
     check(rb"APPLY5_RC=0", "v5 apply exit 0")
     check(rb"-rw-r--r--.*aegis-v5\.img\.xz", "joined file aegis-v5.img.xz listed in update dir")
+if ok:
+    # 6. TAMPERED PART: swap the fake API to a v6.0.1 release whose
+    # part-01 bytes are flipped (sums keep the good hashes). apply
+    # must die on the checksum mismatch and leave no partial .xz and
+    # no part files behind.
+    swap_release(t_release, t_sums, part_dir=t_dir)
+    print("[v6jump-test] host: fake API swapped to tampered v6.0.1 release", flush=True)
+    mark()
+    send(f"echo MARK_VJ_TAMPER; {SUDO} env AEGIS_API_BASE={HOST_URL} aegis-update apply; echo TAMPER_RC=$?; {SUDO} ls -l /var/lib/aegis/update/v6.0.1/; test ! -e /var/lib/aegis/update/v6.0.1/aegis-v6.img.xz && echo NO_XZ_LEFT; ls /var/lib/aegis/update/v6.0.1/ | grep -q part- && echo PARTS_LEFT || echo NO_PARTS_LEFT\n")
+    ok &= drain("tamper", timeout=240)
+    check(rb"checksum mismatch for aegis-v6\.img\.xz\.part-01", "tampered part refused on checksum mismatch")
+    check(rb"TAMPER_RC=1", "tampered apply exit non-zero")
+    check(rb"NO_XZ_LEFT", "tampered apply leaves no partial final file")
+    check(rb"NO_PARTS_LEFT", "tampered apply leaves no part files")
 if ok:
     send("echo MARK_VJ_DONE; echo secure | sudo -S poweroff\n")
     drain("done")

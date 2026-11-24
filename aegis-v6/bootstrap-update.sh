@@ -35,11 +35,12 @@ fi
 # src-path | destination | sha256 (hashes of the v6.0.0 files in this
 # folder — re-compute the hashes if any of these files changes before
 # pushing an update to this script).
-# Recomputed 2026-11-22 after the -c aegis IPC fix (aegis-gui) and the
-# v5-regex fix (aegis-update).
+# Recomputed 2026-11-24 after the streaming rewrite (aegis-update:
+# parts are streamed one at a time into the final .xz, no combine
+# step; an already-staged verified image is resumed, not re-downloaded).
 FILES="aegis-v6/src/bin/aegis-gui|/usr/local/bin/aegis-gui|943532f09479b61dbeed0b4272beecf6312d0757cb421141c795b16496f247a6
 aegis-v6/bin/aegis-tools|/usr/local/bin/aegis-tools|7c3930e8fcfd8bac9cbdf3e5c64ebccbc1b21f6fd79eb182ce16df3d6470a22c
-aegis-v6/src/bin/aegis-update|/usr/local/bin/aegis-update|222cf879c5c6204e4b41ed2f9688122adb899173b4c07e394c4410a1d31fbefb"
+aegis-v6/src/bin/aegis-update|/usr/local/bin/aegis-update|28c906e70365465ef2d5578125036e34147eca23a7d9b8b8e03b7c97797435c5"
 
 echo "bootstrap-update: downloading 3 files from $BASE ..."
 while IFS='|' read -r src dest hash; do

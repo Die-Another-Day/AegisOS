@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Updater test for AegisOS v5.0.3.
+"""Updater test for AegisOS v5.0.3 (streaming rewrite 2026-11-24).
 
 Boots a COPY of the image in QEMU (serial console, no display) and
 exercises aegis-update end to end. Serves all test fixtures from a local
@@ -9,35 +9,33 @@ HTTP server on the host (guest reaches it at 10.0.2.2:18080):
      the HTTP code. If the guest cannot reach it, that is reported as a
      finding, not faked.
   2. `aegis-update check` against the REAL API (latest release at test
-     time is v5.0.2; installed is 5.0.3, so expect "newer than latest").
-     This step is RECORDED, not gating: this VM's QEMU user networking
-     has no external egress (proven by net-probe-v502: DNS gets no
-     answer, TCP to the outside fails; only the 10.0.2.2 host channel
-     works), so the real-API check is expected to fail HERE and is
-     proven instead against the local fake API in step 2b.
+     time is v6.0.0; installed is 5.0.3, so expect an update to be
+     available). This step is RECORDED, not gating: this VM's QEMU user
+     networking has no external egress (proven by net-probe-v502: DNS
+     gets no answer, TCP to the outside fails; only the 10.0.2.2 host
+     channel works), so the real-API check is expected to fail HERE and
+     is proven instead against the local fake API in step 2b.
   2b. `AEGIS_API_BASE=http://10.0.2.2:18080 aegis-update check` — the
      same code path against the fake release (v5.0.5, full image only).
-  3. Patch apply: `sudo aegis-update apply --url
-     http://10.0.2.2:18080/test-patch.tar.gz` — a locally built bundle
-     (version 5.0.4) that writes /etc/aegis-test-patch.txt and restarts
-     aegis.service. Verifies: file contents, backup under
-     /var/lib/aegis/backup/5.0.3/, version file reads 5.0.4, console
-     still answers /api/health after the restart.
-  4. Tampered bundle: same manifest, one payload byte flipped —
-     `apply --url` must refuse it, change nothing, and leave the version
-     at 5.0.4.
-  5. Non-root apply must refuse (exit 2, "needs root").
-  6. Full-image fallback: `sudo env AEGIS_API_BASE=http://10.0.2.2:18080
-     aegis-update apply` against a FAKE release (v5.0.5, no patch asset,
-     two tiny parts + SHA256SUMS.txt served locally). Verifies: parts
-     downloaded + checksummed, reassembled .xz passes `xz -t`, the
-     updater prints STOP with flashing instructions and does NOT touch
-     the booted disk, version stays 5.0.4.
+  3. Bootstrap (AEGIS_RAW_BASE -> local server): installs the new
+     streaming updater from source, installed hash is 28c906e7...,
+     version stays 5.0.3.
+  4. Non-root apply must refuse (exit 2, "needs root").
+  5. Streaming full-image apply: `sudo env
+     AEGIS_API_BASE=http://10.0.2.2:18080 aegis-update apply` against
+     the FAKE release (v5.0.5, two parts + SHA256SUMS.txt served
+     locally). Verifies: parts downloaded + checksummed + appended +
+     deleted (no part files left), staged .xz byte-identical to the
+     fixture (hash matches the release notes), the updater prints STOP
+     with flashing instructions and does NOT touch the booted disk,
+     version stays 5.0.3.
+
+Patch-bundle tests are gone with the patch-bundle code (removed
+2026-11-24: no bundle was ever published, no builder exists).
 
 Usage: update-test-v502.py <image> <logfile>
 """
 import hashlib
-import io
 import json
 import os
 import pty
@@ -46,46 +44,32 @@ import select
 import shutil
 import subprocess
 import sys
-import tarfile
 import threading
 import time
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 IMG, LOG = sys.argv[1], sys.argv[2]
+SRC = Path(__file__).resolve().parent  # the aegis-v5 source folder
 SERVE = Path("/tmp/aegis-update-test-serve")
 PORT = 18080
 HOST_URL = f"http://10.0.2.2:{PORT}"
+
+NEW_UPDATER_HASH = "28c906e70365465ef2d5578125036e34147eca23a7d9b8b8e03b7c97797435c5"
 
 # --- Build test fixtures on the host --------------------------------------
 if SERVE.exists():
     shutil.rmtree(SERVE)
 SERVE.mkdir(parents=True)
 
-def make_bundle(path, version, tag, tamper=False, post_apply=None):
-    payload = b"patch-ok v5.0.4\n"
-    if tamper:
-        payload = b"patch-ok v5.0.4 tampered\n"  # manifest keeps the good hash
-    manifest = {
-        "format": "aegis-patch/1",
-        "tag": tag,
-        "version": version,
-        "files": [{"path": "etc/aegis-test-patch.txt",
-                   "sha256": hashlib.sha256(b"patch-ok v5.0.4\n").hexdigest(),
-                   "mode": "644"}],
-        "post_apply": post_apply or ["systemctl restart aegis.service"],
-    }
-    with tarfile.open(path, "w:gz") as tf:
-        m = json.dumps(manifest, indent=2).encode()
-        ti = tarfile.TarInfo("manifest.json")
-        ti.size = len(m)
-        tf.addfile(ti, io.BytesIO(m))
-        ti = tarfile.TarInfo("etc/aegis-test-patch.txt")
-        ti.size = len(payload)
-        tf.addfile(ti, io.BytesIO(payload))
-
-make_bundle(SERVE / "test-patch.tar.gz", "5.0.4", "v5.0.4")
-make_bundle(SERVE / "test-patch-tampered.tar.gz", "5.0.4", "v5.0.4", tamper=True)
+# Bootstrap files, served at the raw.githubusercontent.com layout.
+for rel in ("aegis-v5/bootstrap-update.sh", "aegis-v5/wayland/aegis-shell.py",
+            "aegis-v5/bin/aegis-gui", "aegis-v5/serial-shell-test-v501.py",
+            "aegis-v5/bin/aegis-update"):
+    src = SRC / rel.removeprefix("aegis-v5/")
+    dst = SERVE / rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
 
 # Fake full image: a tiny xz, split into 2 parts, served with checksums.
 fake_raw = SERVE / "fake.img"
@@ -180,12 +164,23 @@ def drain(label, timeout=180):
     pat = re.compile(m.encode() + rb"\r+\n.*?analyst@aegis", re.DOTALL)
     return wait_for(pat, timeout, f"drain {label}")
 
+seg_start = [0]
+def mark():
+    seg_start[0] = len(buf)
+
 def check(pat, label):
     global ok
-    found = re.search(pat, buf)
+    found = re.search(pat, buf[seg_start[0]:])
     print(f"[update-test] {'PASS' if found else 'FAIL'} {label}: {pat}", flush=True)
     ok = ok and bool(found)
     return bool(found)
+
+def check_absent(pat, label):
+    global ok
+    found = re.search(pat, buf[seg_start[0]:])
+    print(f"[update-test] {'PASS' if not found else 'FAIL'} {label} (absent): {pat}", flush=True)
+    ok = ok and not found
+    return not found
 
 ok = True
 SUDO = "echo secure | sudo -S"
@@ -198,6 +193,7 @@ if ok:
     # 1. Guest internet: real GitHub API. RECORDED, not gating — this
     # VM's QEMU user networking has no external egress (see net-probe
     # logs), so a failure here is an environment finding, not a bug.
+    mark()
     send("echo MARK_UPD_NET; curl -s -o /tmp/api.json -w 'API_HTTP=%{http_code}\\n' --max-time 30 https://api.github.com/repos/Die-Another-Day/AegisOS/releases/latest; grep -o '\"tag_name\": \"[^\"]*\"' /tmp/api.json | head -1; echo; ip -brief addr\n")
     ok &= drain("net")
     if re.search(rb"API_HTTP=200", buf):
@@ -207,50 +203,60 @@ if ok:
               "(environment: QEMU user-net has no external egress here; "
               "real-API check proven via fake API in step 2b instead)", flush=True)
 if ok:
-    # 2. check against the real API (installed 5.0.3 vs latest v5.0.2).
+    # 2. check against the real API (installed 5.0.3 vs latest v6.0.0).
     # Only meaningful if the net step above succeeded; otherwise the
     # updater must print its clear no-network message.
+    mark()
     send("echo MARK_UPD_CHECK; cat /etc/aegis-version; which aegis-update; aegis-update check; echo CHECK_RC=$?\n")
     ok &= drain("check")
     check(rb"Installed version: 5\.0\.3", "installed version is 5.0.3")
     if re.search(rb"API_HTTP=200", buf):
-        check(rb"Latest release:\s+v5\.0\.2", "latest release reported as v5.0.2")
-        check(rb"newer than the latest release", "check reports installed newer")
+        check(rb"Latest release:\s+v6\.0\.0", "latest release reported as v6.0.0")
+        check(rb"Update available: v6\.0\.0", "check reports v6.0.0 update available")
     else:
         check(rb"cannot reach the GitHub API", "check fails gracefully with no network")
 if ok:
     # 2b. Same check code path against the local fake API (v5.0.5).
+    mark()
     send(f"echo MARK_UPD_CHECKFAKE; AEGIS_API_BASE={HOST_URL} aegis-update check; echo CHECKFAKE_RC=$?\n")
     ok &= drain("checkfake")
     check(rb"Latest release:\s+v5\.0\.5", "fake-API check reports v5.0.5")
     check(rb"Update available: v5\.0\.5 \(full image only", "fake-API check reports full-image update")
 if ok:
-    # 3. Non-root apply must refuse.
-    send(f"echo MARK_UPD_NOROOT; aegis-update apply --bundle /tmp/nope.tar.gz; echo NOROOT_RC=$?\n")
+    # 3. Bootstrap installs the new streaming updater from source.
+    mark()
+    send(f"echo MARK_UPD_BS; curl -fsSL {HOST_URL}/aegis-v5/bootstrap-update.sh -o /tmp/bootstrap-update.sh && {SUDO} env AEGIS_RAW_BASE={HOST_URL} bash /tmp/bootstrap-update.sh; echo BS_RC=$?; sha256sum /usr/local/bin/aegis-update; cat /etc/aegis-version\n")
+    ok &= drain("bootstrap", timeout=240)
+    check(rb"BS_RC=0", "bootstrap exit 0")
+    check(re.escape(NEW_UPDATER_HASH).encode(), "new streaming updater installed")
+    check(rb"5\.0\.3", "bootstrap leaves version at 5.0.3")
+if ok:
+    # 4. Non-root apply must refuse.
+    mark()
+    send("echo MARK_UPD_NOROOT; aegis-update apply; echo NOROOT_RC=$?\n")
     ok &= drain("noroot")
     check(rb"needs root", "non-root apply refused")
+    check(rb"NOROOT_RC=2", "non-root apply exit 2")
 if ok:
-    # 4. Good patch bundle apply.
-    send(f"echo MARK_UPD_APPLY; {SUDO} aegis-update apply --url {HOST_URL}/test-patch.tar.gz; echo APPLY_RC=$?; cat /etc/aegis-version; cat /etc/aegis-test-patch.txt; {SUDO} ls -R /var/lib/aegis/backup/; sleep 3; curl -s --max-time 10 http://127.0.0.1:8000/api/health | head -c 300; echo\n")
-    ok &= drain("apply", timeout=240)
-    check(rb"APPLY_RC=0", "patch apply exit 0")
-    check(rb"patch-ok v5\.0\.4", "patched file has new content")
-    check(rb"/var/lib/aegis/backup/5\.0\.3", "backup dir for 5.0.3 exists")
-    check(rb'"ok": true', "console still answers after post_apply restart")
-if ok:
-    # 5. Tampered bundle must be refused with nothing changed.
-    send(f"echo MARK_UPD_TAMPER; {SUDO} aegis-update apply --url {HOST_URL}/test-patch-tampered.tar.gz; echo TAMPER_RC=$?; cat /etc/aegis-version; cat /etc/aegis-test-patch.txt\n")
-    ok &= drain("tamper", timeout=240)
-    check(rb"hash mismatch", "tampered bundle refused on hash mismatch")
-    check(rb"TAMPER_RC=1", "tampered apply exit non-zero")
-if ok:
-    # 6. Full-image fallback against the fake API.
-    send(f"echo MARK_UPD_FULL; {SUDO} env AEGIS_API_BASE={HOST_URL} aegis-update apply; echo FULL_RC=$?; cat /etc/aegis-version; {SUDO} ls -l /var/lib/aegis/update/v5.0.5/; cat /var/lib/aegis/update/v5.0.5/aegis-v5.img.xz 2>/dev/null | head -c 0; echo\n")
+    # 5. Streaming full-image apply against the fake API.
+    mark()
+    send(f"echo MARK_UPD_FULL; {SUDO} env AEGIS_API_BASE={HOST_URL} aegis-update apply; echo FULL_RC=$?; cat /etc/aegis-version\n")
     ok &= drain("full", timeout=240)
-    check(rb"STOP", "fallback prints STOP, does not install")
-    check(rb"FULL_RC=0", "fallback exit 0")
-    check(rb"aegis-v5\.img\.xz\.part-00: OK", "fallback verified part checksums")
-    check(rb"matches the release notes", "fallback reassembled hash matches")
+    check(rb"aegis-v5\.img\.xz\.part-00: OK", "streaming apply verified part-00")
+    check(rb"aegis-v5\.img\.xz\.part-01: OK", "streaming apply verified part-01")
+    check(rb"matches the release notes", "streaming apply assembled hash matches")
+    check(rb"STOP", "streaming apply prints STOP, does not install")
+    check(rb"FULL_RC=0", "streaming apply exit 0")
+    check(rb"5\.0\.3", "version file still 5.0.3 after apply")
+if ok:
+    # The staged .xz must be byte-identical to the fixture and no part
+    # files may be left behind (deleted as they are appended).
+    mark()
+    send(f"echo MARK_UPD_LS; {SUDO} ls -l /var/lib/aegis/update/v5.0.5/; {SUDO} sha256sum /var/lib/aegis/update/v5.0.5/aegis-v5.img.xz\n")
+    ok &= drain("ls")
+    check(rb"-rw-r--r--.*aegis-v5\.img\.xz", "staged file aegis-v5.img.xz listed")
+    check(re.escape(fake_xz_hash).encode(), "staged .xz byte-identical (sha256 matches fixture)")
+    check_absent(rb"part-", "no part files left in update dir after streaming apply")
 if ok:
     send("echo MARK_UPD_DONE; echo secure | sudo -S poweroff\n")
     drain("done")

@@ -1,44 +1,42 @@
 #!/usr/bin/env python3
-"""aegis-update — patch-based updater for AegisOS v5.
+"""aegis-update — full-image updater for AegisOS.
 
-  aegis-update                  same as `check`
-  aegis-update check            installed version vs latest GitHub release
-  aegis-update apply            apply the latest patch bundle if the release
-                                carries one, else fetch the full image and
-                                stop with flashing instructions
-  aegis-update apply --bundle PATH   apply a local patch bundle (testing)
-  aegis-update apply --url URL       apply a patch bundle from a URL (testing)
+  aegis-update          same as `check`
+  aegis-update check    installed version vs latest GitHub release
+  aegis-update apply    fetch the latest full image and stop with
+                        flashing instructions (as root)
 
-Patch bundles (format "aegis-patch/1") are small: only the files that
-changed. A bundle is a .tar.gz holding manifest.json plus the files:
+The updater downloads the release's full image — the split
+`aegis-v<major>.img.xz.part-*` assets plus `SHA256SUMS.txt` — and
+stages it at /var/lib/aegis/update/<tag>/aegis-v<major>.img.xz. The
+major version comes from the release tag (v6.0.0 -> v6), so a v5
+system can fetch a v6 image. It never writes to the disk the running
+system booted from; the new image has to be flashed to USB or
+attached as a new VM disk (instructions are printed).
 
-  {
-    "format": "aegis-patch/1",
-    "tag": "v5.0.2",
-    "version": "5.0.2",
-    "files": [
-      {"path": "usr/local/bin/aegis-gui", "sha256": "<hex>", "mode": "755"}
-    ],
-    "post_apply": ["systemctl restart aegis.service"]
-  }
+How the download works — like a real Linux/Windows updater. The old
+code downloaded every part, kept them all, and only then combined
+them into the .xz, which needed twice the download size on disk
+(parts + reassembled file side by side):
 
-  * "path" is relative to / — absolute paths and ".." are refused.
-  * Every file's SHA256 is verified BEFORE anything is applied.
-  * Every replaced file is backed up to /var/lib/aegis/backup/<old-version>/.
-  * post_apply commands run only if they match a small allowlist
-    (systemctl restart/reload of an aegis-*.service unit, or
-    aegis-lab-reset-flags). Anything else refuses the whole bundle.
-  * On any verification failure nothing is applied and exit is non-zero.
+  * Streaming: each part is downloaded, SHA256-verified against
+    SHA256SUMS.txt, appended to the final .xz, and deleted. The
+    final file grows as parts arrive; there is no separate combine
+    step and parts never coexist with the finished file. Peak disk
+    is the final file + one part, so the space guard is
+    total + largest part + 100 MiB slack.
+  * Resume: if the staged .xz already exists and verifies (size
+    matches the release, and its SHA256 matches the hash in the
+    release notes when one is published), `apply` skips the download
+    entirely and just prints STOP again. A partial or corrupt staged
+    file is deleted and the download is redone from scratch.
 
-Full-image fallback: if the latest release has no patch bundle, the
-updater downloads all aegis-v<major>.img.xz.part-* + SHA256SUMS.txt into
-/var/lib/aegis/update/<tag>/, verifies every checksum, reassembles
-the .xz and integrity-checks it with `xz -t` when xz is installed
-(xz is not in the image, so that test is skipped there — the per-part
-checksums already verified every downloaded byte) — then STOPS. It never
-writes to the disk the running system booted from; the new image has
-to be flashed to USB or attached as a new VM disk (instructions are
-printed). Disk space needed for the download: ~1.5 GB free.
+Patch bundles are gone. The `aegis-patch/1` bundle machinery
+(`<tag>-patch.tar.gz`, manifest verification, post_apply allowlist,
+--bundle/--url flags) was removed 2026-11-24: no patch bundle was
+ever published for any release and no bundle builder was ever built,
+so it was dead code. If a bundle builder is ever built, the
+mechanism can be re-added.
 
 Needs root for `apply` (sudo). `check` works as any user. Network is
 the GitHub API (api.github.com) plus release downloads; with no
@@ -54,21 +52,18 @@ import re
 import shutil
 import subprocess
 import sys
-import tarfile
-import tempfile
 
 REPO = "Die-Another-Day/AegisOS"
 API_BASE = os.environ.get("AEGIS_API_BASE", "https://api.github.com")
 VERSION_FILE = "/etc/aegis-version"
 UPDATE_DIR = "/var/lib/aegis/update"
-BACKUP_DIR = "/var/lib/aegis/backup"
 # Images before v5.0.2 shipped with no version file; they are all v5.0.
 DEFAULT_VERSION = "5.0"
-# A patch bundle for release <tag> is published as this asset name.
-PATCH_ASSET = "{tag}-patch.tar.gz"
-# Allowlist for manifest post_apply commands (run as root).
-POST_APPLY_RE = re.compile(r"^systemctl (restart|reload) aegis(-[a-z0-9-]+)?\.service$")
-POST_APPLY_EXACT = {"aegis-lab-reset-flags"}
+
+
+class UpdateError(Exception):
+    """A failure inside apply_full_image. Raised instead of exiting so
+    the caller can delete a half-streamed image before dying."""
 
 
 def die(msg, code=1):
@@ -125,15 +120,67 @@ def get_latest_release():
     return data
 
 
-def find_asset(release, name):
-    for a in release.get("assets", []):
-        if a.get("name") == name:
-            return a
-    return None
+def image_parts(release, tag):
+    """(major, sorted part names, total bytes, assets-by-name) for a release's
+    full image. Part assets are named aegis-v<major>.img.xz.part-NN, with
+    the major version taken from the tag (v6.0.0 -> v6, v5.0.5 -> v5).
+    Hardcoding `aegis-v5` (the old code) matched nothing in the v6.0.0
+    release, so every v5->v6 `apply` died with "no complete image parts"."""
+    major = tag.split(".")[0]
+    assets = {a["name"]: a for a in release.get("assets", [])}
+    parts = sorted(n for n in assets
+                   if re.match(rf"aegis-{re.escape(major)}\.img\.xz\.part-\d+$", n))
+    total = sum(assets[n].get("size", 0) for n in parts)
+    return major, parts, total, assets
+
+
+def release_notes_xz_hash(release, major):
+    """SHA256 of the compressed .xz from the release notes, if published.
+    Two formats are seen: the test fixtures' "Compressed .xz SHA256:
+    <hex>" line, and the real release notes' "Compressed
+    `aegis-v<major>.img.xz` (N parts):" followed by the hash in
+    backticks on the next line. Returns None when no hash is found."""
+    body = release.get("body") or ""
+    m = re.search(r"Compressed \.xz SHA256:\s*([0-9a-f]{64})", body)
+    if m:
+        return m.group(1)
+    m = re.search(r"Compressed `aegis-" + re.escape(major) +
+                  r"\.img\.xz`[^`]*`([0-9a-f]{64})`", body, re.DOTALL)
+    return m.group(1) if m else None
+
+
+def staged_is_valid(path, total, release, major):
+    """True only if the staged .xz is complete and verified: its size
+    must match the release's part total, and its SHA256 must match the
+    hash in the release notes when one is published (falling back to
+    `xz -t` when xz exists — it does not in the image, so the notes
+    hash is what normally decides). Anything unverifiable counts as
+    invalid, so a later apply re-downloads rather than trusting it."""
+    try:
+        if os.path.getsize(path) != total:
+            return False
+    except OSError:
+        return False
+    notes_hash = release_notes_xz_hash(release, major)
+    if notes_hash is not None:
+        try:
+            return sha256_file(path) == notes_hash
+        except OSError:
+            return False
+    if shutil.which("xz") is not None:
+        try:
+            r = subprocess.run(["xz", "-t", path], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, timeout=300)
+        except (OSError, subprocess.SubprocessError):
+            return False
+        return r.returncode == 0
+    return False
 
 
 def download(url, dest):
-    # curl with a hard wall-clock limit (covers DNS too).
+    # curl with a hard wall-clock limit (covers DNS too). Raises
+    # UpdateError instead of exiting, so the caller can clean up a
+    # half-streamed image before dying.
     try:
         r = subprocess.run(
             ["curl", "-fsSL", "--max-time", "300",
@@ -142,9 +189,9 @@ def download(url, dest):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, timeout=330)
     except (OSError, subprocess.SubprocessError) as e:
-        die(f"download failed ({url}): {e}")
+        raise UpdateError(f"download failed ({url}): {e}")
     if r.returncode != 0:
-        die(f"download failed ({url}): curl exit {r.returncode}")
+        raise UpdateError(f"download failed ({url}): curl exit {r.returncode}")
 
 
 def sha256_file(path):
@@ -175,205 +222,27 @@ def cmd_check():
     if cmp == 0:
         print("You are up to date.")
         return 0
-    patch = find_asset(release, PATCH_ASSET.format(tag=tag))
-    if patch:
-        print(f"Update available: {tag} (patch bundle, "
-              f"{patch.get('size', 0) // 1024} KiB) — run: sudo aegis-update apply")
+    # Full-image size from the release's own part sizes — the old
+    # hardcoded "~400 MB" was the v5 image and wrong for v6 (~778 MB).
+    _major, _parts, total, _assets = image_parts(release, tag)
+    if _parts and total:
+        print(f"Update available: {tag} (full image only, "
+              f"~{total // (1024 * 1024)} MB download) "
+              f"— run: sudo aegis-update apply")
     else:
-        print(f"Update available: {tag} (full image only, ~400 MB download) "
+        print(f"Update available: {tag} (full image only) "
               f"— run: sudo aegis-update apply")
     return 0
 
 
-def _safe_relpath(p):
-    # Manifest paths must be relative to / and contain no "..".
-    if not p or os.path.isabs(p) or ".." in p.split("/"):
-        return None
-    return p
-
-
-def verify_bundle(path):
-    """Return (manifest, {relpath: bytes}) after full hash verification."""
-    try:
-        tf = tarfile.open(path, "r:gz")
-    except (tarfile.TarError, OSError) as e:
-        die(f"cannot open patch bundle {path}: {e}")
-    try:
-        try:
-            m = tf.getmember("manifest.json")
-        except KeyError:
-            die("patch bundle has no manifest.json")
-        manifest = json.loads(tf.extractfile(m).read().decode("utf-8"))
-        if manifest.get("format") != "aegis-patch/1":
-            die("patch bundle format is not aegis-patch/1")
-        if not manifest.get("version") or not manifest.get("tag"):
-            die("patch bundle manifest is missing version/tag")
-        files = manifest.get("files") or []
-        if not isinstance(files, list) or not files:
-            die("patch bundle manifest lists no files")
-        blobs = {}
-        for entry in files:
-            rel = _safe_relpath(entry.get("path", ""))
-            if rel is None:
-                die(f"patch bundle refuses unsafe path: {entry.get('path')!r}")
-            if "sha256" not in entry:
-                die(f"patch bundle entry {rel} has no sha256")
-            try:
-                member = tf.getmember(rel)
-            except KeyError:
-                die(f"patch bundle is missing file: {rel}")
-            data = tf.extractfile(member).read()
-            if hashlib.sha256(data).hexdigest() != entry["sha256"]:
-                die(f"patch bundle hash mismatch for {rel} — refusing to apply")
-            blobs[rel] = (data, entry.get("mode", "644"))
-        for cmd in manifest.get("post_apply", []):
-            if cmd in POST_APPLY_EXACT or POST_APPLY_RE.match(cmd):
-                continue
-            die(f"patch bundle post_apply command not allowed: {cmd!r}")
-        return manifest, blobs
-    finally:
-        tf.close()
-
-
-def apply_bundle(path, tag_hint=None):
-    if os.geteuid() != 0:
-        die("apply needs root — run: sudo aegis-update apply", code=2)
-    manifest, blobs = verify_bundle(path)
-    installed = read_installed()
-    tag = manifest["tag"]
-    version = manifest["version"]
-    if version_tuple(version) <= version_tuple(installed) and not tag_hint:
-        print(f"Installed {installed} is already at or newer than "
-              f"{version} — nothing to apply.")
-        return 0
-    print(f"Applying patch {tag} (from {installed} to {version})...")
-    backup_root = os.path.join(BACKUP_DIR, installed)
-    os.makedirs(backup_root, exist_ok=True)
-    applied = []
-    try:
-        for rel, (data, mode) in blobs.items():
-            target = os.path.join("/", rel)
-            os.makedirs(os.path.dirname(target), exist_ok=True)
-            if os.path.exists(target) and not os.path.islink(target):
-                backup = os.path.join(backup_root, rel)
-                os.makedirs(os.path.dirname(backup), exist_ok=True)
-                shutil.copy2(target, backup)
-                print(f"  backed up {rel} -> {backup}")
-            # Write via temp file + rename so a half-written file is
-            # never left in place.
-            fd, tmp = tempfile.mkstemp(dir=os.path.dirname(target) or "/",
-                                       prefix=".aegis-update-")
-            try:
-                with os.fdopen(fd, "wb") as f:
-                    f.write(data)
-                os.chmod(tmp, int(str(mode), 8))
-                os.replace(tmp, target)
-            except BaseException:
-                try:
-                    os.unlink(tmp)
-                except OSError:
-                    pass
-                raise
-            applied.append(rel)
-            print(f"  applied {rel}")
-    except BaseException as e:
-        print(f"aegis-update: apply failed halfway ({e}) — files already "
-              f"applied: {applied}. Restores are in {backup_root}.", file=sys.stderr)
-        return 1
-    for cmd in manifest.get("post_apply", []):
-        print(f"  post_apply: {cmd}")
-        r = subprocess.run(cmd.split(), stdout=subprocess.PIPE,
-                           stderr=subprocess.STDOUT, text=True, timeout=120)
-        sys.stdout.write(r.stdout or "")
-        if r.returncode != 0:
-            print(f"aegis-update: post_apply failed ({cmd}) — version left "
-                  f"at {installed}; restores are in {backup_root}.",
-                  file=sys.stderr)
-            return 1
-    with open(VERSION_FILE, "w") as f:
-        f.write(version + "\n")
-    print(f"Done — AegisOS is now {version} (backups in {backup_root}).")
-    return 0
-
-
-def apply_full_image(release, tag):
-    if os.geteuid() != 0:
-        die("apply needs root — run: sudo aegis-update apply", code=2)
-    dest_dir = os.path.join(UPDATE_DIR, tag)
-    os.makedirs(dest_dir, exist_ok=True)
-    assets = {a["name"]: a for a in release.get("assets", [])}
-    # NOTE (found 2026-11-22, update-test-v6): the part regex was
-    # hardcoded to `aegis-v5` — a v5 carry-over. v6 parts are named
-    # `aegis-v6.img.xz.part-NN`, so the match was always empty and every
-    # full-image fallback died with "no complete image parts". Derive
-    # the major version from the release tag instead (v6.0.2 -> v6).
-    major = tag.split(".")[0]
-    parts = sorted(n for n in assets
-                   if re.match(rf"aegis-{re.escape(major)}\.img\.xz\.part-\d+$", n))
-    if not parts or "SHA256SUMS.txt" not in assets:
-        die(f"release {tag} has no patch bundle and no complete image "
-            f"parts — cannot update from this release")
-    # Disk-space guard: parts (~405 MB) + reassembled .xz (~405 MB).
-    free = shutil.disk_usage(dest_dir).free
-    if free < 1500 * 1024 * 1024:
-        die(f"not enough free space in {dest_dir} "
-            f"({free // (1024 * 1024)} MiB free, need ~1500 MiB)")
-    print(f"No patch bundle for {tag} — fetching the full image "
-          f"({len(parts)} parts, ~400 MB) into {dest_dir} ...")
-    for name in parts + ["SHA256SUMS.txt"]:
-        dest = os.path.join(dest_dir, name)
-        if os.path.exists(dest) and name != "SHA256SUMS.txt":
-            print(f"  {name} already downloaded, skipping")
-            continue
-        print(f"  downloading {name} ...")
-        download(assets[name]["browser_download_url"], dest)
-    sums = os.path.join(dest_dir, "SHA256SUMS.txt")
-    # Pure-Python verification (no shell-out): parse SHA256SUMS.txt and
-    # check every listed part with hashlib. Prints "name: OK" per part.
-    expected = {}
-    for line in open(sums).read().splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        h, _, name = line.partition(" ")
-        expected[os.path.basename(name.strip().lstrip("*"))] = h.strip()
-    for name in parts:
-        if name not in expected:
-            die(f"no checksum listed for {name}")
-        got = sha256_file(os.path.join(dest_dir, name))
-        if got != expected[name]:
-            die(f"checksum mismatch for {name} — the download is corrupt; "
-                f"delete {dest_dir} and try again")
-        print(f"{name}: OK")
-    joined = os.path.join(dest_dir, f"aegis-{major}.img.xz")
-    with open(joined, "wb") as out:
-        for name in parts:
-            with open(os.path.join(dest_dir, name), "rb") as f:
-                shutil.copyfileobj(f, out, length=1024 * 256)
-    print("Verifying the reassembled image ...")
-    if shutil.which("xz") is None:
-        print("note: xz is not installed in this image, so the .xz integrity")
-        print("test is skipped — the per-part checksums above already")
-        print("verified every downloaded byte.")
+def print_stop(major, joined, already=False):
+    if already:
+        print(f"Image already staged and verified: {joined} "
+              f"({os.path.getsize(joined) // (1024 * 1024)} MiB) — "
+              f"skipping the download.")
     else:
-        try:
-            r = subprocess.run(["xz", "-t", joined], stdout=subprocess.PIPE,
-                               stderr=subprocess.STDOUT, text=True, timeout=300)
-        except (OSError, subprocess.SubprocessError) as e:
-            die(f"could not run xz -t on the reassembled image: {e}")
-        if r.returncode != 0:
-            die(f"reassembled image failed integrity check: {r.stdout}")
-    # Best-effort cross-check against the hash in the release notes.
-    m = re.search(r"Compressed \.xz SHA256:\s*([0-9a-f]{64})",
-                  release.get("body") or "")
-    if m:
-        got = sha256_file(joined)
-        if got != m.group(1):
-            die("reassembled image hash does not match the release notes — "
-                "the download is corrupt")
-        print(f"  reassembled .xz SHA256 matches the release notes: {got}")
-    print(f"Image downloaded and verified: {joined} "
-          f"({os.path.getsize(joined) // (1024 * 1024)} MiB)")
+        print(f"Image downloaded and verified: {joined} "
+              f"({os.path.getsize(joined) // (1024 * 1024)} MiB)")
     print()
     print("STOP — the new image is staged, not installed.")
     print("AegisOS cannot overwrite the disk it booted from. To use it:")
@@ -385,29 +254,123 @@ def apply_full_image(release, tag):
           "old one until the new one boots), or replace the disk file")
     print("          in a powered-off VM and boot it.")
     print("  * Then boot, log in as analyst, and run: aegis-update check")
+
+
+def apply_full_image(release, tag):
+    if os.geteuid() != 0:
+        die("apply needs root — run: sudo aegis-update apply", code=2)
+    dest_dir = os.path.join(UPDATE_DIR, tag)
+    os.makedirs(dest_dir, exist_ok=True)
+    major, parts, total, assets = image_parts(release, tag)
+    if not parts or "SHA256SUMS.txt" not in assets:
+        die(f"release {tag} has no complete image parts "
+            f"— cannot update from this release")
+    joined = os.path.join(dest_dir, f"aegis-{major}.img.xz")
+    # Resume: a staged image that verifies is already done — do not
+    # re-download it. (This is the case the user hit on 2026-11-23: a
+    # second apply died on disk space although the image was staged.)
+    if os.path.exists(joined):
+        if staged_is_valid(joined, total, release, major):
+            print_stop(major, joined, already=True)
+            return 0
+        print(f"Staged image {joined} is incomplete or corrupt — "
+              f"deleting it and downloading again.")
+        try:
+            os.unlink(joined)
+        except OSError:
+            pass
+    # Disk-space guard: the final file (total) + one part at a time
+    # (largest part) + 100 MiB slack. The old guard needed twice the
+    # download (parts + reassembled .xz kept side by side) — for v6
+    # that was ~1656 MiB; streaming needs ~900 MiB.
+    largest = max(assets[n].get("size", 0) for n in parts)
+    need = total + largest + 100 * 1024 * 1024
+    free = shutil.disk_usage(dest_dir).free
+    if free < need:
+        die(f"not enough free space in {dest_dir} "
+            f"({free // (1024 * 1024)} MiB free, need ~{need // (1024 * 1024)} MiB)")
+    print(f"Fetching the full image for {tag} "
+          f"({len(parts)} parts, ~{total // (1024 * 1024)} MB, streamed) "
+          f"into {dest_dir} ...")
+    part_path = None
+    try:
+        print("  downloading SHA256SUMS.txt ...")
+        download(assets["SHA256SUMS.txt"]["browser_download_url"],
+                 os.path.join(dest_dir, "SHA256SUMS.txt"))
+        # Pure-Python verification (no shell-out): parse SHA256SUMS.txt.
+        expected = {}
+        for line in open(os.path.join(dest_dir, "SHA256SUMS.txt")).read().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            h, _, name = line.partition(" ")
+            expected[os.path.basename(name.strip().lstrip("*"))] = h.strip()
+        # Stream: download one part, verify it, append it to the final
+        # .xz, delete it. A part left over from an interrupted run is
+        # reused when its hash matches, re-downloaded when it does not.
+        with open(joined, "wb") as out:
+            for name in parts:
+                part_path = os.path.join(dest_dir, name)
+                if name not in expected:
+                    raise UpdateError(f"no checksum listed for {name}")
+                if os.path.exists(part_path):
+                    if sha256_file(part_path) == expected[name]:
+                        print(f"  {name} already downloaded, appending")
+                    else:
+                        print(f"  {name} on disk is corrupt — re-downloading")
+                        os.unlink(part_path)
+                        print(f"  downloading {name} ...")
+                        download(assets[name]["browser_download_url"], part_path)
+                        if sha256_file(part_path) != expected[name]:
+                            raise UpdateError(f"checksum mismatch for {name} — the download is corrupt")
+                else:
+                    print(f"  downloading {name} ...")
+                    download(assets[name]["browser_download_url"], part_path)
+                    if sha256_file(part_path) != expected[name]:
+                        raise UpdateError(f"checksum mismatch for {name} — the download is corrupt")
+                with open(part_path, "rb") as f:
+                    shutil.copyfileobj(f, out, length=1024 * 256)
+                os.unlink(part_path)
+                print(f"{name}: OK")
+        # Final check against the release-notes hash when one is
+        # published (the per-part checksums already verified every
+        # byte, so this is a second, independent source).
+        notes_hash = release_notes_xz_hash(release, major)
+        if notes_hash is not None:
+            got = sha256_file(joined)
+            if got != notes_hash:
+                raise UpdateError("assembled image hash does not match the release notes — the download is corrupt")
+            print(f"  assembled .xz SHA256 matches the release notes: {got}")
+        elif shutil.which("xz") is not None:
+            r = subprocess.run(["xz", "-t", joined], stdout=subprocess.PIPE,
+                               stderr=subprocess.STDOUT, text=True, timeout=300)
+            if r.returncode != 0:
+                raise UpdateError(f"assembled image failed integrity check: {r.stdout}")
+            print("  assembled .xz passed the integrity check (xz -t)")
+        else:
+            print("  note: no independent final check available (no xz, no "
+                  "hash in the release notes) — the per-part checksums "
+                  "already verified every downloaded byte.")
+    except UpdateError as e:
+        # Never leave a half-streamed image behind: the resume check
+        # would reject it anyway, but deleting it now means the next
+        # apply starts clean instead of re-verifying a corrupt file.
+        for p in (joined, part_path):
+            if p:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+        die(str(e))
+    print_stop(major, joined, already=False)
     return 0
 
 
 def cmd_apply(args):
-    bundle = None
-    url = None
-    i = 0
-    while i < len(args):
-        if args[i] == "--bundle" and i + 1 < len(args):
-            bundle, i = args[i + 1], i + 2
-        elif args[i] == "--url" and i + 1 < len(args):
-            url, i = args[i + 1], i + 2
-        else:
-            die(f"unknown argument: {args[i]}", code=2)
-    if bundle:
-        return apply_bundle(bundle, tag_hint="local")
-    if url:
-        if os.geteuid() != 0:
-            die("apply needs root — run: sudo aegis-update apply", code=2)
-        tmp = os.path.join(tempfile.gettempdir(), "aegis-patch.tar.gz")
-        print(f"Downloading patch bundle from {url} ...")
-        download(url, tmp)
-        return apply_bundle(tmp, tag_hint="url")
+    if args:
+        die(f"unknown argument: {args[0]}", code=2)
+    if os.geteuid() != 0:
+        die("apply needs root — run: sudo aegis-update apply", code=2)
     release = get_latest_release()
     if release is None:
         print("aegis-update: cannot reach the GitHub API "
@@ -419,13 +382,6 @@ def cmd_apply(args):
         print(f"Installed {installed} is already at or newer than {tag} "
               f"— nothing to do.")
         return 0
-    patch = find_asset(release, PATCH_ASSET.format(tag=tag))
-    if patch:
-        tmp = os.path.join(tempfile.gettempdir(), "aegis-patch.tar.gz")
-        print(f"Downloading patch bundle {patch['name']} "
-              f"({patch.get('size', 0) // 1024} KiB) ...")
-        download(patch["browser_download_url"], tmp)
-        return apply_bundle(tmp)
     return apply_full_image(release, tag)
 
 

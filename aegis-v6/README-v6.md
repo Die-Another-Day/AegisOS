@@ -28,7 +28,7 @@ Red vs Blue lab (off by default), Saral 0.3.0 built in.
   `aegis-lab --enable`. Never binds 0.0.0.0; refuses public IPs.
 - Console server on http://127.0.0.1:8000 (`/api/health` → AegisOS 6.0).
 - Saral 0.3.0 (`saral version`).
-- `aegis-update` + `bootstrap-update.sh` (patch-based updates).
+- `aegis-update` + `bootstrap-update.sh` (full-image updates, streamed).
 - BIOS GRUB, hostname `aegis`, login `analyst` / `secure` (change it),
   lab user `labuser` / `lab123` (lab only).
 - The v5.0.3 cursor lesson: software cursors
@@ -53,10 +53,13 @@ See also /usr/share/aegis/LOGO-SLOT-README.md inside the image.
 
 - `aegis-update check` — installed version (from /etc/aegis-version)
   vs latest GitHub release. Works as any user; fails gracefully offline.
-- `aegis-update apply` (as root) — applies the release's
-  `<tag>-patch.tar.gz` if one exists, else falls back to the full image
-  (downloads parts, verifies checksums, prints STOP with flashing
-  instructions — it never touches the booted disk).
+- `aegis-update apply` (as root) — fetches the release's full image,
+  streamed one part at a time (download, verify, append, delete — no
+  combine step), verifies the staged image, prints STOP with flashing
+  instructions — it never touches the booted disk. If the staged image
+  already exists and verifies, the download is skipped; a corrupt
+  staged image is deleted and re-downloaded. Patch bundles were
+  removed 2026-11-24 (none was ever published, no builder exists).
 - `bootstrap-update.sh` — for v6.0.0 systems: fetches changed files
   from GitHub main with SHA256 verification (installs are verified,
   see v5.0.3).

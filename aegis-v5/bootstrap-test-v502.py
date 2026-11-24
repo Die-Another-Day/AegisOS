@@ -49,7 +49,7 @@ EXPECTED = {
     "aegis-v5/wayland/aegis-shell.py": "a862c7aa67987f82f5dd94e38fd4fe9c0c53b0cda64a74c4033cdfe49ea60edb",
     "aegis-v5/bin/aegis-gui": "b92cc53595ef7cca9f26f9779b976dc15f82b20c34797ca2bd8ff154e62dbd98",  # v5.0.3 preflight guard + WLR_NO_HARDWARE_CURSORS cursor fix
     "aegis-v5/serial-shell-test-v501.py": "53e0703bdd1400d7a0e36ba805ee2a5ba71b1a3e13b42a50b7f3b806b5154a6b",
-    "aegis-v5/bin/aegis-update": "65830fb31ed61db9005422b8220d61058a941cbb36efe307706c1e3a5edcb647",  # 2026-11-23 hotfix: major version from release tag (v5->v6 fetch)
+    "aegis-v5/bin/aegis-update": "28c906e70365465ef2d5578125036e34147eca23a7d9b8b8e03b7c97797435c5",  # 2026-11-24 streaming rewrite (no patch bundles, no combine step)
 }
 
 if SERVE.exists():
